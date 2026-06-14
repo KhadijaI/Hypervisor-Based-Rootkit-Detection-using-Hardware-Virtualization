@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VMI FORENSIC DASHBOARD</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-left">
+                <h1>VMI FORENSIC DASHBOARD</h1>
+                <small>Hypervisor-Based Rootkit Detection System -- v1.0.0</small>
+            </div>
+            <div class="header-right">
+                <div class="status-indicator">
+                    <span class="status-dot" id="system-status"></span>
+                    <span id="status-text">INITIALIZING</span>
+                </div>
+                <div class="uptime">
+                    UPTIME: <span id="uptime-value">00:00:00</span>
+                </div>
+                <button id="export-btn" class="export-btn">EXPORT EVIDENCE</button>
+                <button id="discover-btn" class="export-btn">DISCOVER VMS</button>
+            </div>
+        </div>
+
+        <div class="vm-status-row" id="vm-status-row"></div>
+
+        <div class="tabs">
+            <button class="nav-tab active" data-tab="overview">OVERVIEW</button>
+            <button class="nav-tab" data-tab="processes">PROCESSES</button>
+            <button class="nav-tab" data-tab="syscall">SYSCALLS</button>
+            <button class="nav-tab" data-tab="idt">IDT</button>
+            <button class="nav-tab" data-tab="fallback">FALLBACK</button>
+            <button class="nav-tab" data-tab="guest">GUEST INFO</button>
+        </div>
+
+        <div id="overview-tab" class="tab-content" style="display: block;">
+            <div class="stats-grid">
+                <div class="stat-card threat" id="stat-rootkit-card">
+                    <div class="stat-label">ROOTKITS FOUND</div>
+                    <div class="stat-value" id="rootkit-count">0</div>
+                    <div class="stat-desc">Critical threats</div>
+                </div>
+                <div class="stat-card warning" id="stat-suspicious-card">
+                    <div class="stat-label">SUSPICIOUS</div>
+                    <div class="stat-value" id="suspicious-count">0</div>
+                    <div class="stat-desc">Needs investigation</div>
+                </div>
+                <div class="stat-card info" id="stat-info-card">
+                    <div class="stat-label">INFORMATION</div>
+                    <div class="stat-value" id="info-count">0</div>
+                    <div class="stat-desc">System events</div>
+                </div>
+                <div class="stat-card success">
+                    <div class="stat-label">SCANS COMPLETED</div>
+                    <div class="stat-value" id="scan-count">0</div>
+                    <div class="stat-desc">Monitoring cycles</div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">ALERT FEED</div>
+                </div>
+                <div class="alert-list" id="alert-list"></div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">DETECTION MODULES</div>
+                </div>
+                <div class="module-list" id="module-list"></div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">FORENSIC AUDIT LOG</div>
+                </div>
+                <div class="audit-list" id="forensic-log-list"></div>
+            </div>
+        </div>
+
+        <div id="processes-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">PROCESS DETECTION RESULTS</div>
+                </div>
+                <div id="hidden-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div id="syscall-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">SYSCALL TABLE INTEGRITY CHECK</div>
+                </div>
+                <div id="syscall-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div id="idt-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">IDT INTEGRITY CHECK</div>
+                </div>
+                <div id="idt-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div id="fallback-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">FALLBACK DETECTION RESULTS</div>
+                </div>
+                <div id="fallback-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div id="guest-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">GUEST AGENT INFORMATION</div>
+                </div>
+                <div id="guest-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div class="footer">
+            VMI FORENSIC SYSTEM -- Hypervisor-Based Rootkit Detection -- FYP Project
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

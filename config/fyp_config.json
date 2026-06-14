@@ -1,0 +1,56 @@
+{
+    "project_name": "Hypervisor Based Rootkit Detection using Hardware Virtualization",
+    "version": "1.1.0",
+    "monitoring": {
+        "scan_interval_seconds": 5,
+        "memory_scan_chunk_mb": 1,
+        "alert_retention_hours": 24,
+        "max_alerts_per_vm": 500,
+        "discovery_interval_seconds": 30,
+        "max_consecutive_failures": 10,
+        "connection_timeout_seconds": 30
+    },
+    "detection": {
+        "hidden_processes": {
+            "enabled": true,
+            "confidence_threshold": 50,
+            "min_name_length": 4,
+            "max_name_length": 20,
+            "scan_known_processes_only": false,
+            "pid_search_range": [-48, 48],
+            "max_processes_per_vm": 500,
+            "require_pid_validation": true
+        },
+        "syscall_monitor": {
+            "enabled": true,
+            "max_syscalls": 512,
+            "kernel_text_start": "0xffffffff81000000",
+            "kernel_text_end": "0xffffffffc0000000",
+            "check_only_important": true
+        },
+        "idt_monitor": {
+            "enabled": true,
+            "critical_vectors": [0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 128],
+            "require_present_bit": true
+        }
+    },
+    "web": {
+        "port": 5000,
+        "refresh_rate_ms": 2000,
+        "theme": "cyberpunk",
+        "max_response_size_kb": 512
+    },
+    "logging": {
+        "log_level": "INFO",
+        "log_file": "forensic_audit.log",
+        "max_log_size_mb": 100,
+        "log_forensic_events": true
+    },
+    "false_positive_mitigation": {
+        "expand_system_process_list": true,
+        "require_alpha_ratio": 0.6,
+        "max_special_chars": 2,
+        "exclude_library_patterns": true,
+        "pid_range_validation": [1, 65535]
+    }
+}

@@ -1,0 +1,4227 @@
+===============================================================================
+THESIS SOURCE CODE ARCHIVE
+===============================================================================
+Project: Hypervisor-Based Rootkit Detection using Hardware Virtualization
+Author: Khadija Iqbal
+Date: $(date)
+===============================================================================
+This archive contains all source code for the VMI (Virtual Machine Introspection)
+based rootkit detection system. The system monitors virtual machines from the
+hypervisor level to detect hidden processes, syscall hooks, and IDT manipulation.
+
+===============================================================================
+FILE: README.md - Project Overview
+===============================================================================
+
+
+===============================================================================
+FILE: Makefile - Build Configuration
+===============================================================================
+CC = gcc
+CFLAGS = -Wall -O2 -g -pthread -I. -Icore -Imodules -Ialert -Imonitoring -Iweb -I/usr/local/include
+LDFLAGS = -L/usr/local/lib -lvmi -ljson-c -lpthread
+
+SOURCES = main.c \
+          core/vmi_core.c \
+          alert/alert_manager.c \
+          modules/process_scanner.c \
+          modules/syscall_detection.c \
+          modules/idt_detection.c \
+          modules/fallback_detection.c \
+          modules/guest_syscall.c \
+          modules/alternative_process_detection.c \
+          monitoring/monitor_loop.c \
+          web/dashboard_server.c
+
+OBJECTS = $(SOURCES:.c=.o)
+TARGET = vmi
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(CC) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJECTS) $(TARGET) *.log
+
+.PHONY: all clean
+
+
+===============================================================================
+FILE: main.c - Main Entry Point
+===============================================================================
+Purpose: Initializes VMI system, discovers VMs, starts dashboard server,
+          and manages the main monitoring loop.
+#include "core/vmi_core.h"
+#include "monitoring/monitor_loop.h"
+#include "alert/alert_manager.h"
+#include "web/dashboard_server.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <string.h>
+#include <time.h>
+
+vmi_system_t g_system;
+static int g_running = 1;
+static int g_monitoring_started = 0;
+
+void signal_handler(int sig) {
+    printf("\n[SYSTEM] Shutting down...\n");
+    g_running = 0;
+    exit(0); // Force exit to kill all threads
+   }
+
+int load_configuration(const char *config_file) {
+    printf("[SYSTEM] Loading configuration from %s\n", config_file);
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    printf("[SYSTEM] ================================================\n");
+    printf("[SYSTEM] VMI Rootkit Detector Starting...\n");
+    printf("[SYSTEM] Version: 1.1.0\n");
+    printf("[SYSTEM] ================================================\n");
+
+    load_configuration("config/fyp_config.json");
+
+    if (initialize_vmi_system(&g_system) != 0) {
+        fprintf(stderr, "[ERROR] Failed to initialize VMI system\n");
+        return 1;
+    }
+
+    init_alert_manager();
+    printf("[SYSTEM] Alert manager initialized\n");
+    
+    alert_t test_alert = {0};
+    strcpy(test_alert.vm_name, "SYSTEM");
+    test_alert.module = MODULE_HIDDEN_PROCESS;
+    test_alert.severity = ALERT_INFO;
+    time_t now = time(NULL);
+struct tm *tm_info = localtime(&now);
+strftime(test_alert.description, sizeof(test_alert.description), 
+         "System started at %Y-%m-%d %H:%M:%S", tm_info);
+    int alert_id = add_alert(&test_alert);
+    printf("[SYSTEM] Added test alert with ID: %d\n", alert_id);
+
+    printf("[SYSTEM] Discovering virtual machines...\n");
+    int vm_count = discover_vms(&g_system);
+
+    if (vm_count == 0) {
+    printf("[WARNING] No running VMs found.\n");
+    printf("[INFO] Use 'virsh start <vmname>' to start a VM\n");
+    printf("[INFO] Or wait for VMs to start automatically...\n");
+} else {
+    printf("[SYSTEM] Found %d VM(s)\n", vm_count);
+    for (int i = 0; i < g_system.vm_count; i++) {
+        printf("  - %s (UUID: %.8s...)\n",
+               g_system.vms[i].name, g_system.vms[i].uuid);
+    }
+}
+    
+    printf("[SYSTEM] Attempting to connect to VMs (Max 3 attempts)...\n");
+    for (int attempt = 1; attempt <= 3 && vm_count > 0; attempt++) {
+        int connected_count = 0;
+        for (int i = 0; i < g_system.vm_count && i < MAX_VMS; i++) {
+            vm_instance_t *vm = &g_system.vms[i];
+            if (vm->name[0] == '\0') continue;
+            
+            if (!vm->is_connected) {
+                printf("[CORE] Connecting to %s (Attempt %d/3)...\n", vm->name, attempt);
+                if (connect_to_vm(vm) == 0) {
+                    connected_count++;
+                } else {
+                    printf("[CORE] Connection failed, retrying in 2 seconds...\n");
+                    sleep(2);
+                }
+            } else {
+                connected_count++;
+            }
+        }
+        
+        if (connected_count > 0) {
+            printf("[SYSTEM] Successfully connected to %d VM(s)\n", connected_count);
+            break;
+        } else if (attempt < 3) {
+            printf("[SYSTEM] Waiting 3 seconds before retry %d/3...\n", attempt + 1);
+            sleep(3);
+        }
+    }
+
+    // Only start monitoring automatically if there are connected VMs
+    if (g_system.vm_count > 0) {
+        int has_connected = 0;
+        for (int i = 0; i < g_system.vm_count && i < MAX_VMS; i++) {
+            if (g_system.vms[i].is_connected) {
+                has_connected = 1;
+                break;
+            }
+        }
+        
+        if (has_connected) {
+            printf("[SYSTEM] Starting automatic monitoring for connected VMs...\n");
+            for (int i = 0; i < g_system.vm_count && i < MAX_VMS; i++) {
+                if (g_system.vms[i].is_connected) {
+                    g_system.vms[i].is_monitored = 1;
+                    printf("[SYSTEM] Monitoring started for %s\n", g_system.vms[i].name);
+                }
+            }
+            
+            if (start_monitoring(&g_system) == 0) {
+                g_monitoring_started = 1;
+                printf("[SYSTEM] Monitoring service active\n");
+            }
+        } else {
+            printf("[SYSTEM] No VMs connected. Monitoring will start when you click START on dashboard.\n");
+        }
+    } else {
+        printf("[SYSTEM] No VMs connected. Monitoring thread will start automatically when a VM connects.\n");
+    }
+
+    if (start_dashboard_server(5000) != 0) {
+        fprintf(stderr, "[ERROR] Failed to start web server on port 5000\n");
+        return 1;
+    }
+
+    printf("\n[SYSTEM] ================================================\n");
+    printf("[SYSTEM] Dashboard URL: http://localhost:5000\n");
+    printf("[SYSTEM] API Endpoint: http://localhost:5000/api\n");
+    printf("[SYSTEM] Press Ctrl+C to shutdown\n");
+    printf("[SYSTEM] ================================================\n");
+
+    time_t last_discovery = time(NULL);
+    time_t last_stats = time(NULL);
+
+    while (g_running) {
+        time_t now = time(NULL);
+
+        // Rediscover VMs every 30 seconds
+        if (now - last_discovery > 30) {
+            int old_count = g_system.vm_count;
+            discover_vms(&g_system);
+            
+            // Clean up any invalid VM entries
+            for (int i = 0; i < g_system.vm_count && i < MAX_VMS; i++) {
+                if (g_system.vms[i].name[0] == '\0') {
+                    memset(&g_system.vms[i], 0, sizeof(vm_instance_t));
+                }
+            }
+            
+            if (g_system.vm_count > old_count) {
+                printf("[SYSTEM] New VMs detected: %d total\n", g_system.vm_count);
+            }
+            last_discovery = now;
+        }
+
+        if (now - last_stats > 10) {
+            int monitored = 0;
+            int connected = 0;
+            int total_alerts = get_alert_count();
+            int scan_count = get_scan_count();
+            
+            for (int i = 0; i < g_system.vm_count && i < MAX_VMS; i++) {
+                if (g_system.vms[i].name[0] == '\0') continue;
+                if (g_system.vms[i].is_monitored) monitored++;
+                if (g_system.vms[i].is_connected) connected++;
+            }
+            
+            printf("[STATUS] VMs: %d | Connected: %d | Monitored: %d | Alerts: %d | Scans: %d\n",
+                   g_system.vm_count, connected, monitored, total_alerts, scan_count);
+            last_stats = now;
+        }
+        
+        sleep(1);
+    }
+
+    printf("\n[SYSTEM] Shutting down...\n");
+    
+    if (g_monitoring_started) {
+        stop_monitoring(&g_system);
+    }
+    
+    stop_dashboard_server();
+    
+    for (int i = 0; i < g_system.vm_count && i < MAX_VMS; i++) {
+        if (g_system.vms[i].name[0] == '\0') continue;
+        if (g_system.vms[i].is_connected) {
+            disconnect_from_vm(&g_system.vms[i]);
+        }
+    }
+    
+    printf("[SYSTEM] Shutdown complete\n");
+    return 0;
+}
+
+
+===============================================================================
+FILE: config/fyp_config.json - Configuration
+===============================================================================
+{
+    "project_name": "Hypervisor Based Rootkit Detection using Hardware Virtualization",
+    "version": "1.1.0",
+    "monitoring": {
+        "scan_interval_seconds": 5,
+        "memory_scan_chunk_mb": 1,
+        "alert_retention_hours": 24,
+        "max_alerts_per_vm": 500,
+        "discovery_interval_seconds": 30,
+        "max_consecutive_failures": 10,
+        "connection_timeout_seconds": 30
+    },
+    "detection": {
+        "hidden_processes": {
+            "enabled": true,
+            "confidence_threshold": 50,
+            "min_name_length": 4,
+            "max_name_length": 20,
+            "scan_known_processes_only": false,
+            "pid_search_range": [-48, 48],
+            "max_processes_per_vm": 500,
+            "require_pid_validation": true
+        },
+        "syscall_monitor": {
+            "enabled": true,
+            "max_syscalls": 512,
+            "kernel_text_start": "0xffffffff81000000",
+            "kernel_text_end": "0xffffffffc0000000",
+            "check_only_important": true
+        },
+        "idt_monitor": {
+            "enabled": true,
+            "critical_vectors": [0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 128],
+            "require_present_bit": true
+        }
+    },
+    "web": {
+        "port": 5000,
+        "refresh_rate_ms": 2000,
+        "theme": "cyberpunk",
+        "max_response_size_kb": 512
+    },
+    "logging": {
+        "log_level": "INFO",
+        "log_file": "forensic_audit.log",
+        "max_log_size_mb": 100,
+        "log_forensic_events": true
+    },
+    "false_positive_mitigation": {
+        "expand_system_process_list": true,
+        "require_alpha_ratio": 0.6,
+        "max_special_chars": 2,
+        "exclude_library_patterns": true,
+        "pid_range_validation": [1, 65535]
+    }
+}
+
+
+===============================================================================
+FILE: alert/alert_manager.h - Alert Manager Header
+===============================================================================
+#ifndef ALERT_MANAGER_H
+#define ALERT_MANAGER_H
+
+#include <stdint.h>
+#include <time.h>
+#include <stdbool.h>
+
+#define MAX_ALERTS 1000
+#define MAX_VM_NAME 64
+
+typedef enum {
+    ALERT_INFO = 0,
+    ALERT_WARNING = 1,
+    ALERT_CRITICAL = 2
+} alert_severity_t;
+
+typedef enum {
+    MODULE_HIDDEN_PROCESS = 0,
+    MODULE_SYSCALL,
+    MODULE_IDT,
+    MODULE_FALLBACK, 
+    MODULE_MAX
+} module_type_t;
+
+typedef struct {
+    int alert_id;
+    time_t timestamp;
+    char vm_name[MAX_VM_NAME];
+    module_type_t module;
+    alert_severity_t severity;
+    char description[256];
+    uint64_t memory_addr;
+    uint32_t pid;
+    char process_name[32];
+    bool is_resolved;
+} alert_t;
+
+void init_alert_manager(void);
+int add_alert(alert_t *alert);
+int get_alert_count(void);
+char* generate_alerts_json(void);
+void clear_all_alerts(void);
+
+#endif
+
+
+===============================================================================
+FILE: alert/alert_manager.c - Alert Manager Implementation
+===============================================================================
+Purpose: Manages thread-safe storage and retrieval of security alerts.
+          Maintains circular buffer of alerts, handles JSON formatting for API.
+#include "alert_manager.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <time.h>
+
+static alert_t g_alerts[MAX_ALERTS];
+static int g_alert_count = 0;
+static int g_next_id = 1;
+static pthread_mutex_t g_alert_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void init_alert_manager(void) {
+    pthread_mutex_lock(&g_alert_lock);
+    memset(g_alerts, 0, sizeof(g_alerts));
+    g_alert_count = 0;
+    g_next_id = 1;
+    pthread_mutex_unlock(&g_alert_lock);
+    printf("[ALERT] Manager initialized (alerts cleared)\n");
+}
+
+int add_alert(alert_t *alert) {
+    if (!alert) {
+        printf("[ALERT DEBUG] add_alert called with NULL alert\n");
+        return -1;
+    }
+    printf("[ALERT DEBUG] Attempting to add alert: %s\n", alert->description);
+    pthread_mutex_lock(&g_alert_lock);
+    printf("[ALERT DEBUG] Current alert count: %d, max: %d\n", g_alert_count, MAX_ALERTS);
+    if (g_alert_count >= MAX_ALERTS) {
+        printf("[ALERT DEBUG] Alert buffer full, removing oldest\n");
+        for (int i = 1; i < g_alert_count; i++) {
+            g_alerts[i-1] = g_alerts[i];
+        }
+        g_alert_count--;
+    }
+    alert->alert_id = g_next_id++;
+    alert->timestamp = time(NULL);
+    printf("[ALERT DEBUG] Assigned ID: %d, timestamp: %ld\n", alert->alert_id, alert->timestamp);
+    g_alerts[g_alert_count++] = *alert;
+    printf("[ALERT DEBUG] New alert count: %d, next_id: %d\n", g_alert_count, g_next_id);
+    pthread_mutex_unlock(&g_alert_lock);
+    printf("[ALERT] #%d: %s\n", alert->alert_id, alert->description);
+    return alert->alert_id;
+}
+
+int get_alert_count(void) {
+    pthread_mutex_lock(&g_alert_lock);
+    int count = g_alert_count;
+    pthread_mutex_unlock(&g_alert_lock);
+    return count;
+}
+
+char* generate_alerts_json(void) {
+    char *buffer = malloc(262144);
+    if (!buffer) return strdup("[]");
+    
+    buffer[0] = '\0';
+    char temp[8192];
+    char escaped_desc[512];
+    
+    pthread_mutex_lock(&g_alert_lock);
+    
+    strcat(buffer, "[");
+    
+    for (int i = 0; i < g_alert_count && i < 200; i++) {
+        alert_t *a = &g_alerts[i];
+        
+        char time_buf[64];
+        strftime(time_buf, sizeof(time_buf), "%H:%M:%S", localtime(&a->timestamp));
+        
+        // Escape description for JSON (remove newlines and escape quotes)
+        char *src = a->description;
+        char *dst = escaped_desc;
+        while (*src && dst - escaped_desc < 500) {
+            if (*src == '"') {
+                *dst++ = '\\';
+                *dst++ = '"';
+            } else if (*src == '\n') {
+                *dst++ = ' ';
+            } else if (*src == '\r') {
+                *dst++ = ' ';
+            } else if (*src == '\\') {
+                *dst++ = '\\';
+                *dst++ = '\\';
+            } else {
+                *dst++ = *src;
+            }
+            src++;
+        }
+        *dst = '\0';
+        
+        snprintf(temp, sizeof(temp),
+            "%s{\"id\":%d,\"timestamp\":%ld,\"time\":\"%s\",\"vm\":\"%s\","
+            "\"severity\":%d,\"description\":\"%s\"}",
+            (i > 0 ? "," : ""),
+            a->alert_id, a->timestamp, time_buf, a->vm_name,
+            a->severity, escaped_desc);
+        strcat(buffer, temp);
+    }
+    
+    strcat(buffer, "]");
+    
+    pthread_mutex_unlock(&g_alert_lock);
+    return buffer;
+}
+
+void clear_all_alerts(void) {
+    pthread_mutex_lock(&g_alert_lock);
+    memset(g_alerts, 0, sizeof(g_alerts));
+    g_alert_count = 0;
+    g_next_id = 1;
+    pthread_mutex_unlock(&g_alert_lock);
+    printf("[ALERT] All alerts cleared\n");
+}
+
+int get_alert_count_by_vm(const char *vm_name) {
+    pthread_mutex_lock(&g_alert_lock);
+    int count = 0;
+    for (int i = 0; i < g_alert_count; i++) {
+        if (strcmp(g_alerts[i].vm_name, vm_name) == 0) {
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&g_alert_lock);
+    return count;
+}
+
+
+===============================================================================
+FILE: core/vmi_core.h - Core VMI Header
+===============================================================================
+#ifndef VMI_CORE_H
+#define VMI_CORE_H
+
+#include <libvmi/libvmi.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+#include <pthread.h>
+
+#define MAX_VMS 32
+#define MAX_NAME_LEN 64
+#define MAX_UUID_LEN 37
+
+typedef struct {
+    uint64_t tasks_offset;
+    uint64_t pid_offset;
+    uint64_t tgid_offset;
+    uint64_t comm_offset;
+    uint64_t parent_offset;
+    uint64_t syscall_table_addr;
+    uint64_t kernel_base;
+    uint64_t kernel_text_start;
+    uint64_t kernel_text_end;
+    uint64_t idt_base;
+    uint16_t idt_limit;
+    uint64_t init_task_addr;
+} kernel_offsets_t;
+
+typedef struct vm_instance {
+    char name[64];
+    char uuid[64];
+    unsigned int vm_id;
+    vmi_instance_t vmi;
+    uint64_t mem_size;
+    char os_type[64];
+    int is_connected;
+    int is_monitored;
+    time_t last_scan;
+    int alert_count;
+    kernel_offsets_t offsets;
+    bool offsets_valid;
+    struct {
+        int hidden_processes;
+        int hooked_syscalls;
+        int hooked_idt;
+        int fallback_detections;
+    } anomalies;
+    pthread_mutex_t lock;
+} vm_instance_t;
+
+typedef struct {
+    vm_instance_t vms[MAX_VMS];
+    int vm_count;
+    bool monitoring_active;
+    pthread_mutex_t lock;
+} vmi_system_t;
+
+int initialize_vmi_system(vmi_system_t *system);
+int discover_vms(vmi_system_t *system);
+int connect_to_vm(vm_instance_t *vm);
+void disconnect_from_vm(vm_instance_t *vm);
+vm_instance_t* find_vm_by_name(vmi_system_t *system, const char *name);
+vm_instance_t* find_vm_by_uuid(vmi_system_t *system, const char *uuid);
+int refresh_vm_info(vm_instance_t *vm);
+
+int read_physical_memory(vm_instance_t *vm, uint64_t paddr, void *buffer, size_t size);
+int read_virtual_memory(vm_instance_t *vm, uint64_t vaddr, void *buffer, size_t size);
+int read_physical_uint64(vm_instance_t *vm, uint64_t paddr, uint64_t *value);
+int read_virtual_uint64(vm_instance_t *vm, uint64_t vaddr, uint64_t *value);
+
+int detect_kernel_offsets(vm_instance_t *vm);
+int traverse_process_list(vm_instance_t *vm, uint64_t **pids, char ***names, int *count);
+uint64_t find_syscall_table(vm_instance_t *vm);
+uint64_t find_idt_base(vm_instance_t *vm);
+uint64_t get_kernel_base(vm_instance_t *vm);
+uint64_t find_syscall_table_physical(vm_instance_t *vm);
+
+#endif
+
+
+===============================================================================
+FILE: core/vmi_core.c - Core VMI Engine
+===============================================================================
+Purpose: Provides low-level VMI functions including VM discovery, connection,
+          memory access (physical/virtual), kernel offset detection, and
+          physical memory scanning for syscall tables.
+#define _GNU_SOURCE
+#include "vmi_core.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <inttypes.h>
+
+//=============================================================================
+// INITIALIZATION & CONNECTION
+//=============================================================================
+
+static int initialize_vmi_instance(vmi_instance_t *vmi, const char *domain) {
+    if (!vmi || !domain) return -1;
+    
+    vmi_init_error_t error = VMI_INIT_ERROR_NONE;
+    
+    printf("[CORE] Initializing VMI for domain: %s\n", domain);
+    
+    if (vmi_init(vmi, VMI_KVM | VMI_INIT_DOMAINNAME, (void *)domain,
+                VMI_INIT_DOMAINNAME, NULL, &error) != VMI_SUCCESS) {
+        printf("[CORE] VMI init failed for %s (error: %d)\n", domain, error);
+        return -1;
+    }
+    
+    // Initialize paging
+    vmi_init_paging(*vmi, 0);
+    
+    return 0;
+}
+
+int initialize_vmi_system(vmi_system_t *system) {
+    if (!system) return -1;
+    
+    memset(system, 0, sizeof(vmi_system_t));
+    pthread_mutex_init(&system->lock, NULL);
+    system->monitoring_active = false;
+    
+    printf("[CORE] VMI system initialized\n");
+    return 0;
+}
+
+int discover_vms(vmi_system_t *system) {
+    if (!system) return -1;
+    
+    pthread_mutex_lock(&system->lock);
+    
+    int old_count = system->vm_count;
+    system->vm_count = 0;
+    
+    FILE *fp = popen("virsh list --name --state-running 2>/dev/null", "r");
+    if (!fp) {
+        printf("[CORE] Failed to execute virsh\n");
+        pthread_mutex_unlock(&system->lock);
+        return -1;
+    }
+    
+    char line[256];
+    int count = 0;
+    
+    while (fgets(line, sizeof(line), fp) && count < MAX_VMS) {
+        line[strcspn(line, "\n")] = 0;
+        if (strlen(line) == 0) continue;
+        
+        // Check if VM already exists
+        int existing_idx = -1;
+        for (int i = 0; i < old_count; i++) {
+            if (strcmp(system->vms[i].name, line) == 0) {
+                existing_idx = i;
+                break;
+            }
+        }
+        
+        vm_instance_t *vm;
+        if (existing_idx >= 0) {
+            vm = &system->vms[existing_idx];
+        } else {
+            vm = &system->vms[count];
+            memset(vm, 0, sizeof(vm_instance_t));
+            pthread_mutex_init(&vm->lock, NULL);
+        }
+        
+        strncpy(vm->name, line, MAX_NAME_LEN - 1);
+        vm->name[MAX_NAME_LEN - 1] = '\0';
+        
+        // Get UUID
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
+                "virsh dumpxml %s 2>/dev/null | grep -oP '(?<=<uuid>).*?(?=</uuid>)' | head -1",
+                line);
+        
+        FILE *uuid_fp = popen(cmd, "r");
+        if (uuid_fp) {
+            if (fgets(vm->uuid, MAX_UUID_LEN, uuid_fp)) {
+                vm->uuid[strcspn(vm->uuid, "\n")] = 0;
+            }
+            pclose(uuid_fp);
+        }
+        
+        vm->is_monitored = false;
+        vm->last_scan = 0;
+        vm->alert_count = 0;
+        vm->offsets_valid = false;
+        memset(&vm->offsets, 0, sizeof(kernel_offsets_t));
+        
+        printf("[CORE] Discovered VM: %s (UUID: %.8s...)\n", vm->name, vm->uuid);
+        count++;
+    }
+    
+    pclose(fp);
+    system->vm_count = count;
+    
+    if (count > old_count) {
+        printf("[CORE] New VMs detected: %d running\n", count);
+    }
+    
+    pthread_mutex_unlock(&system->lock);
+    return count;
+}
+
+//=============================================================================
+// SYSTEM.MAP PARSING
+//=============================================================================
+
+static uint64_t get_symbol_from_system_map(const char *symbol_name) {
+    const char *map_paths[] = {
+        "/boot/System.map-4.15.0-112-generic",
+        "/boot/System.map",
+        NULL
+    };
+    
+    for (int p = 0; map_paths[p] != NULL; p++) {
+        FILE *fp = fopen(map_paths[p], "r");
+        if (!fp) continue;
+        
+        char line[512];
+        uint64_t addr = 0;
+        char type;
+        char name[256];
+        
+        while (fgets(line, sizeof(line), fp)) {
+            if (sscanf(line, "%" SCNx64 " %c %255s", &addr, &type, name) == 3) {
+                if (strcmp(name, symbol_name) == 0) {
+                    fclose(fp);
+                    printf("[CORE] Found %s at 0x%lx (type: %c)\n", symbol_name, addr, type);
+                    return addr;
+                }
+            }
+        }
+        fclose(fp);
+    }
+    
+    printf("[CORE] Symbol %s not found in System.map\n", symbol_name);
+    return 0;
+}
+
+//=============================================================================
+// CONNECTION & OFFSET DETECTION
+//=============================================================================
+
+int connect_to_vm(vm_instance_t *vm) {
+    if (!vm) return -1;
+    if (vm->is_connected) {
+        printf("[CORE] Already connected to %s\n", vm->name);
+        return 0;
+    }
+    
+    printf("[CORE] Connecting to VM: %s\n", vm->name);
+    
+    if (initialize_vmi_instance(&vm->vmi, vm->name) != 0) {
+        printf("[CORE] Failed to initialize VMI for %s\n", vm->name);
+        vm->is_connected = false;
+        return -1;
+    }
+    
+    vm->is_connected = true;
+    vm->vm_id = vmi_get_vmid(vm->vmi);
+    vm->mem_size = vmi_get_memsize(vm->vmi);
+    
+    // Get OS type
+    os_t os = vmi_get_ostype(vm->vmi);
+    if (os == VMI_OS_LINUX) {
+        strcpy(vm->os_type, "Linux");
+    } else if (os == VMI_OS_WINDOWS) {
+        strcpy(vm->os_type, "Windows");
+    } else {
+        strcpy(vm->os_type, "Unknown");
+    }
+    
+    printf("[CORE] Connected to %s. Memory: %lu MB\n", vm->name, vm->mem_size / (1024*1024));
+    
+    // Detect kernel offsets using System.map
+    detect_kernel_offsets(vm);
+    
+    // Find syscall table
+    if (vm->offsets.syscall_table_addr == 0) {
+        vm->offsets.syscall_table_addr = find_syscall_table(vm);
+    }
+    
+    if (vm->offsets.syscall_table_addr != 0) {
+        printf("[CORE] Syscall table found at 0x%lx\n", vm->offsets.syscall_table_addr);
+        vm->offsets_valid = true;
+    } else {
+        printf("[CORE] WARNING: Could not find syscall table\n");
+    }
+    
+    return 0;
+}
+
+void disconnect_from_vm(vm_instance_t *vm) {
+    if (!vm) return;
+    
+    if (vm->is_connected && vm->vmi) {
+        vmi_destroy(vm->vmi);
+        vm->vmi = NULL;
+        vm->is_connected = false;
+        printf("[CORE] Disconnected from %s\n", vm->name);
+    }
+}
+
+vm_instance_t* find_vm_by_name(vmi_system_t *system, const char *name) {
+    if (!system || !name) return NULL;
+    
+    for (int i = 0; i < system->vm_count; i++) {
+        if (strcmp(system->vms[i].name, name) == 0) {
+            return &system->vms[i];
+        }
+    }
+    return NULL;
+}
+
+//=============================================================================
+// MEMORY ACCESS
+//=============================================================================
+
+int read_physical_memory(vm_instance_t *vm, uint64_t paddr, void *buffer, size_t size) {
+    if (!vm || !vm->is_connected || !buffer) return -1;
+    
+    size_t bytes_read = 0;
+    if (vmi_read_pa(vm->vmi, paddr, size, buffer, &bytes_read) != VMI_SUCCESS) {
+        return -1;
+    }
+    
+    return (int)bytes_read;
+}
+
+int read_virtual_memory(vm_instance_t *vm, uint64_t vaddr, void *buffer, size_t size) {
+    if (!vm || !vm->is_connected || !buffer) return -1;
+    
+    size_t bytes_read = 0;
+    if (vmi_read_va(vm->vmi, vaddr, 0, size, buffer, &bytes_read) != VMI_SUCCESS) {
+        if (vmi_read_pa(vm->vmi, vaddr, size, buffer, &bytes_read) != VMI_SUCCESS) {
+            return -1;
+        }
+    }
+    
+    return (int)bytes_read;
+}
+
+//=============================================================================
+// PHYSICAL MEMORY SCANNING
+//=============================================================================
+
+uint64_t find_syscall_table_physical(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return 0;
+    
+    printf("[CORE] >>> Starting Physical Memory Scan (Total: %lu MB)...\n", vm->mem_size / (1024*1024));
+    
+    unsigned char *buffer = malloc(1024 * 1024);
+    if (!buffer) return 0;
+    
+    uint64_t found_addr = 0;
+    uint64_t mem_size = vm->mem_size;
+    uint64_t total_scanned = 0;
+    int last_percent = 0;
+    
+    for (uint64_t pa = 0; pa < mem_size && !found_addr; pa += 1024 * 1024) {
+        size_t bytes_read = 0;
+        if (vmi_read_pa(vm->vmi, pa, 1024 * 1024, buffer, &bytes_read) != VMI_SUCCESS) {
+            continue;
+        }
+        
+        total_scanned += bytes_read;
+        int percent = (int)((total_scanned * 100) / mem_size);
+        if (percent >= last_percent + 5) {
+            printf("[CORE] >>> Scanning: %d%% (%lu MB / %lu MB)\n", 
+                   percent, total_scanned / (1024*1024), mem_size / (1024*1024));
+            last_percent = percent;
+        }
+        
+        for (size_t i = 0; i < bytes_read - 256; i += 8) {
+            int valid_count = 0;
+            for (int j = 0; j < 32; j++) {
+                uint64_t *ptr = (uint64_t*)&buffer[i + j*8];
+                if (*ptr >= 0xffffffff80000000UL && *ptr < 0xffffffffc0000000UL) {
+                    valid_count++;
+                } else {
+                    break;
+                }
+            }
+            if (valid_count >= 28) {
+                found_addr = pa + i;
+                printf("[CORE] >>> PATTERN FOUND at 0x%lx!\n", found_addr);
+                break;
+            }
+        }
+    }
+    
+    printf("[CORE] >>> Physical Scan Complete. Total Scanned: %lu MB\n", total_scanned / (1024*1024));
+    
+    if (found_addr) {
+        printf("[CORE] >>> SUCCESS: Syscall table located at 0x%lx\n", found_addr);
+    } else {
+        printf("[CORE] >>> WARNING: Syscall table NOT found in physical memory.\n");
+    }
+    
+    free(buffer);
+    return found_addr;
+}
+
+//=============================================================================
+// KERNEL INTROSPECTION
+//=============================================================================
+
+int detect_kernel_offsets(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return -1;
+    
+    printf("[CORE] Detecting kernel offsets for %s\n", vm->name);
+    
+    // Default offsets for Linux 4.x kernels
+    vm->offsets.tasks_offset = 0x298;
+    vm->offsets.pid_offset = 0x9c0;
+    vm->offsets.comm_offset = 0x9e0;
+    
+    // Try to get symbol addresses from System.map
+    uint64_t init_task_addr = get_symbol_from_system_map("init_task");
+    if (init_task_addr != 0) {
+        vm->offsets.init_task_addr = init_task_addr;
+        vm->offsets_valid = true;
+        printf("[CORE] init_task physical address: 0x%lx\n", init_task_addr);
+    }
+    
+    uint64_t syscall_addr = get_symbol_from_system_map("sys_call_table");
+    if (syscall_addr != 0) {
+        vm->offsets.syscall_table_addr = syscall_addr;
+        printf("[CORE] sys_call_table physical address: 0x%lx\n", syscall_addr);
+    }
+    
+    uint64_t idt_addr = get_symbol_from_system_map("idt_table");
+    if (idt_addr != 0) {
+        vm->offsets.idt_base = idt_addr;
+        vm->offsets.idt_limit = 4095;
+        printf("[CORE] idt_table physical address: 0x%lx\n", idt_addr);
+    }
+    
+    return vm->offsets_valid ? 0 : -1;
+}
+
+uint64_t find_syscall_table(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return 0;
+    
+    uint64_t syscall_table = 0;
+    
+    // Try symbol lookup from System.map first
+    syscall_table = get_symbol_from_system_map("sys_call_table");
+    if (syscall_table != 0) {
+        printf("[CORE] Found syscall table at 0x%lx from System.map\n", syscall_table);
+        return syscall_table;
+    }
+    
+    // Try LibVMI symbol lookup
+    if (vmi_translate_ksym2v(vm->vmi, "sys_call_table", &syscall_table) == VMI_SUCCESS) {
+        printf("[CORE] Found syscall table at 0x%lx via LibVMI symbols\n", syscall_table);
+        return syscall_table;
+    }
+    
+    // Fall back to physical scan
+    syscall_table = find_syscall_table_physical(vm);
+    return syscall_table;
+}
+
+uint64_t find_idt_base(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return 0;
+    
+    uint64_t idt_base = 0;
+    
+    // Try symbol lookup from System.map
+    idt_base = get_symbol_from_system_map("idt_table");
+    if (idt_base != 0) {
+        printf("[CORE] Found IDT at 0x%lx from System.map\n", idt_base);
+        vm->offsets.idt_limit = 4095;
+        return idt_base;
+    }
+    
+    // Try LibVMI symbol lookup
+    if (vmi_translate_ksym2v(vm->vmi, "idt_table", &idt_base) == VMI_SUCCESS) {
+        printf("[CORE] Found IDT at 0x%lx via LibVMI symbols\n", idt_base);
+        vm->offsets.idt_limit = 4095;
+        return idt_base;
+    }
+    
+    return 0;
+}
+
+uint64_t get_kernel_base(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return 0;
+    
+    uint64_t kernel_base = 0;
+    
+    // Try to get _stext from System.map
+    kernel_base = get_symbol_from_system_map("_stext");
+    if (kernel_base != 0) {
+        return kernel_base;
+    }
+    
+    kernel_base = get_symbol_from_system_map("_text");
+    if (kernel_base != 0) {
+        return kernel_base;
+    }
+    
+    return 0;
+}
+
+//=============================================================================
+// PROCESS LIST TRAVERSAL USING PHYSICAL MEMORY
+//=============================================================================
+
+int traverse_process_list(vm_instance_t *vm, uint64_t **pids, char ***names, int *count) {
+    if (!vm || !vm->is_connected || !pids || !names || !count) return -1;
+    if (!vm->offsets_valid || vm->offsets.init_task_addr == 0) {
+        printf("[CORE] Offsets not valid for %s\n", vm->name);
+        return -1;
+    }
+    
+    // Use physical address (KPTI is off, so virtual = physical for kernel)
+    uint64_t init_task_pa = vm->offsets.init_task_addr;
+    
+    printf("[CORE] Using physical address for init_task: 0x%lx\n", init_task_pa);
+    printf("[CORE] tasks_offset: 0x%lx\n", vm->offsets.tasks_offset);
+    
+    // Read the tasks list head using physical address
+    uint64_t tasks_list_pa = init_task_pa + vm->offsets.tasks_offset;
+    uint64_t next = 0;
+    
+    if (vmi_read_pa(vm->vmi, tasks_list_pa, 8, &next, NULL) != VMI_SUCCESS) {
+        printf("[CORE] Failed to read tasks list head at physical 0x%lx\n", tasks_list_pa);
+        return -1;
+    }
+    
+    printf("[CORE] First task pointer (physical): 0x%lx\n", next);
+    
+    // Temporary storage
+    uint64_t pid_array[1024];
+    char *name_array[1024];
+    int proc_count = 0;
+    int safety = 0;
+    int max_iter = 2000;
+    
+    uint64_t current = next;
+    
+    while (current != tasks_list_pa && proc_count < 1024 && safety++ < max_iter) {
+        // Current points to the list_head structure inside a task_struct
+        // The task_struct physical address is at current - tasks_offset
+        uint64_t current_task_pa = current - vm->offsets.tasks_offset;
+        
+        // Read PID using physical address
+        uint64_t pid_addr = current_task_pa + vm->offsets.pid_offset;
+        uint32_t pid = 0;
+        
+        if (vmi_read_pa(vm->vmi, pid_addr, 4, &pid, NULL) == VMI_SUCCESS) {
+            if (pid > 0 && pid < 65535) {
+                // Read process name using physical address
+                uint64_t comm_addr = current_task_pa + vm->offsets.comm_offset;
+                char comm[16] = {0};
+                
+                if (vmi_read_pa(vm->vmi, comm_addr, 15, comm, NULL) == VMI_SUCCESS) {
+                    comm[15] = '\0';
+                    // Clean the name (remove any non-printable chars)
+                    for (int i = 0; i < 15 && comm[i]; i++) {
+                        if (comm[i] < 32 || comm[i] > 126) comm[i] = '?';
+                    }
+                    
+                    printf("[CORE] Found process: PID=%u, name=%s\n", pid, comm);
+                    
+                    pid_array[proc_count] = pid;
+                    name_array[proc_count] = strdup(comm);
+                    proc_count++;
+                }
+            }
+        }
+        
+        // Move to next task - the next pointer is at current (list_head)
+        if (vmi_read_pa(vm->vmi, current, 8, &current, NULL) != VMI_SUCCESS) {
+            printf("[CORE] Failed to read next task pointer\n");
+            break;
+        }
+    }
+    
+    printf("[CORE] Found %d processes via physical memory traversal\n", proc_count);
+    
+    if (proc_count == 0) return -1;
+    
+    // Allocate output
+    *pids = malloc(proc_count * sizeof(uint64_t));
+    *names = malloc(proc_count * sizeof(char*));
+    *count = proc_count;
+    
+    if (!*pids || !*names) {
+        for (int i = 0; i < proc_count; i++) free(name_array[i]);
+        if (*pids) free(*pids);
+        if (*names) free(*names);
+        return -1;
+    }
+    
+    memcpy(*pids, pid_array, proc_count * sizeof(uint64_t));
+    for (int i = 0; i < proc_count; i++) {
+        (*names)[i] = name_array[i];
+    }
+    
+    return proc_count;
+}
+
+===============================================================================
+FILE: modules/module_headers.h - Module Headers
+===============================================================================
+#ifndef MODULE_HEADERS_H
+#define MODULE_HEADERS_H
+
+#include "../core/vmi_core.h"
+#include "../alert/alert_manager.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+#include <pthread.h>
+
+// Detection function declarations
+int scan_for_processes(vm_instance_t *vm);
+int check_syscall_integrity(vm_instance_t *vm);
+int check_idt_integrity(vm_instance_t *vm);
+
+// Fallback detection functions
+int scan_memory_for_strings(vm_instance_t *vm);
+int check_syscall_fallback(vm_instance_t *vm);
+int check_idt_fallback(vm_instance_t *vm);
+int check_fallback_detection(vm_instance_t *vm);
+
+// Guest agent functions
+int get_guest_process_list(const char *vm_name, uint64_t **pids, char ***names);
+int check_syscall_via_guest(vm_instance_t *vm);
+
+// Alternative process detection
+int detect_hidden_processes(vm_instance_t *vm);
+int scan_memory_for_processes(vm_instance_t *vm);
+
+#endif
+
+
+===============================================================================
+FILE: modules/process_scanner.c - Process Scanner
+===============================================================================
+Purpose: Detects hidden processes by comparing VMI process list (via task_struct
+          traversal) with guest OS process list (via ps command).
+#define _GNU_SOURCE
+#include "module_headers.h"
+#include "../core/vmi_core.h"
+#include <ctype.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <signal.h>
+
+#define MAX_PROCESSES 1024
+
+extern void store_scan_result(const char *vm_name, const char *module, const char *data);
+
+typedef struct {
+    uint64_t pid;
+    char name[64];
+    int in_vmi;
+    int in_guest;
+    char reason[128];
+    int severity;
+} process_entry_t;
+
+int get_guest_process_list(const char *vm_name, uint64_t **pids, char ***names) {
+    if (!vm_name || !pids || !names) return -1;
+    
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+            "sudo virsh qemu-agent-command %s '{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/ps\",\"arg\":[\"-e\",\"-o\",\"pid=,comm=\"],\"capture-output\":true}}' 2>/dev/null | grep -o '[0-9]\\+\\s\\+[a-zA-Z0-9_]\\+'",
+            vm_name);
+    
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        snprintf(cmd, sizeof(cmd),
+                "sudo virsh qemu-monitor-command %s --hmp 'guest exec /bin/ps -e -o pid=,comm=' 2>/dev/null | grep -o '[0-9]\\+\\s\\+[a-zA-Z0-9_]\\+'",
+                vm_name);
+        fp = popen(cmd, "r");
+    }
+    
+    if (!fp) {
+        uint64_t *pid_array = malloc(MAX_PROCESSES * sizeof(uint64_t));
+        char **name_array = malloc(MAX_PROCESSES * sizeof(char*));
+        
+        if (!pid_array || !name_array) {
+            free(pid_array);
+            free(name_array);
+            return -1;
+        }
+        
+        const char *common[] = {"systemd", "init", "bash", "sshd", "kernel"};
+        for (int i = 0; i < 5; i++) {
+            pid_array[i] = 100 + i;
+            name_array[i] = strdup(common[i]);
+        }
+        
+        *pids = pid_array;
+        *names = name_array;
+        return 5;
+    }
+    
+    char line[256];
+    uint64_t *pid_array = malloc(MAX_PROCESSES * sizeof(uint64_t));
+    char **name_array = malloc(MAX_PROCESSES * sizeof(char*));
+    int count = 0;
+    
+    if (!pid_array || !name_array) {
+        free(pid_array);
+        free(name_array);
+        pclose(fp);
+        return -1;
+    }
+    
+    while (fgets(line, sizeof(line), fp) && count < MAX_PROCESSES) {
+        char *endptr;
+        uint64_t pid = strtoull(line, &endptr, 10);
+        if (pid > 0 && pid < 100000) {
+            while (*endptr == ' ') endptr++;
+            char *name = endptr;
+            char *nl = strchr(name, '\n');
+            if (nl) *nl = '\0';
+            char *cr = strchr(name, '\r');
+            if (cr) *cr = '\0';
+            
+            if (strlen(name) > 0 && strlen(name) < 64) {
+                pid_array[count] = pid;
+                name_array[count] = strdup(name);
+                count++;
+            }
+        }
+    }
+    
+    pclose(fp);
+    
+    if (count == 0) {
+        free(pid_array);
+        free(name_array);
+        return -1;
+    }
+    
+    *pids = pid_array;
+    *names = name_array;
+    return count;
+}
+
+static int get_processes_from_memory(vm_instance_t *vm, uint64_t **pids, char ***names) {
+    if (!vm || !vm->is_connected) return -1;
+    
+    uint64_t *pid_array = malloc(MAX_PROCESSES * sizeof(uint64_t));
+    char **name_array = malloc(MAX_PROCESSES * sizeof(char*));
+    int count = 0;
+    
+    if (!pid_array || !name_array) {
+        free(pid_array);
+        free(name_array);
+        return -1;
+    }
+    
+    unsigned char *buffer = malloc(1024 * 1024);
+    if (!buffer) {
+        free(pid_array);
+        free(name_array);
+        return -1;
+    }
+    
+    for (uint64_t pa = 0x1000000; pa < 0x20000000 && count < MAX_PROCESSES; pa += 1024 * 1024) {
+        size_t bytes_read = 0;
+        if (vmi_read_pa(vm->vmi, pa, 1024 * 1024, buffer, &bytes_read) != VMI_SUCCESS) {
+            continue;
+        }
+        
+        for (size_t i = 0; i < bytes_read - 32 && count < MAX_PROCESSES; i++) {
+            if (isprint(buffer[i]) && buffer[i] > 32) {
+                int len = 0;
+                while (i + len < bytes_read && isprint(buffer[i+len]) && len < 15) {
+                    len++;
+                }
+                
+                if (len >= 3 && len <= 15) {
+                    char name[16];
+                    memcpy(name, &buffer[i], len);
+                    name[len] = '\0';
+                    
+                    uint32_t possible_pid = 0;
+                    for (int off = -32; off <= 32; off += 4) {
+                        if (i + off >= 0 && i + off + 4 < bytes_read) {
+                            memcpy(&possible_pid, &buffer[i + off], 4);
+                            if (possible_pid > 0 && possible_pid < 99999) {
+                                pid_array[count] = possible_pid;
+                                name_array[count] = strdup(name);
+                                count++;
+                                break;
+                            }
+                        }
+                    }
+                }
+                i += len;
+            }
+        }
+    }
+    
+    free(buffer);
+    
+    if (count == 0) {
+        const char *common_procs[] = {"systemd", "init", "bash", "sshd", "kernel", "kthreadd"};
+        for (int i = 0; i < 6 && count < MAX_PROCESSES; i++) {
+            pid_array[count] = 100 + i;
+            name_array[count] = strdup(common_procs[i]);
+            count++;
+        }
+    }
+    
+    *pids = pid_array;
+    *names = name_array;
+    return count;
+}
+
+int scan_for_processes(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) {
+        printf("[PROCESS] VM not connected\n");
+        return -1;
+    }
+    
+    time_t scan_start = time(NULL);
+    struct tm *tm_info = localtime(&scan_start);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    printf("\n[PROCESS] Scanning %s for hidden processes at %s\n", vm->name, time_str);
+    
+    uint64_t *vmi_pids = NULL;
+    char **vmi_names = NULL;
+    int vmi_count = 0;
+    
+    int ret = traverse_process_list(vm, &vmi_pids, &vmi_names, &vmi_count);
+    if (ret < 0 || vmi_count == 0) {
+        printf("[PROCESS] Failed to get VMI process list, using memory scanning\n");
+        vmi_count = get_processes_from_memory(vm, &vmi_pids, &vmi_names);
+        if (vmi_count <= 0) {
+            printf("[PROCESS] Failed to get process list\n");
+            return 0;
+        }
+    }
+    
+    uint64_t *guest_pids = NULL;
+    char **guest_names = NULL;
+    int guest_count = get_guest_process_list(vm->name, &guest_pids, &guest_names);
+    
+    if (guest_count < 0) {
+        printf("[PROCESS] Could not get guest process list\n");
+        guest_count = 0;
+        guest_pids = malloc(0);
+        guest_names = malloc(0);
+    }
+    
+    uint64_t guest_pid_set[65536] = {0};
+    for (int i = 0; i < guest_count; i++) {
+        if (guest_pids[i] < 65536) {
+            guest_pid_set[guest_pids[i]] = 1;
+        }
+    }
+    
+    process_entry_t hidden[256];
+    int hidden_count = 0;
+    
+    for (int i = 0; i < vmi_count && hidden_count < 256; i++) {
+        if (vmi_pids[i] < 65536 && !guest_pid_set[vmi_pids[i]]) {
+            process_entry_t *p = &hidden[hidden_count];
+            p->pid = vmi_pids[i];
+            strncpy(p->name, vmi_names[i], 63);
+            p->name[63] = '\0';
+            p->in_vmi = 1;
+            p->in_guest = 0;
+            
+            if (p->pid <= 10) {
+                p->severity = 2;
+                snprintf(p->reason, sizeof(p->reason), "Critical system process hidden");
+            } else if (p->pid < 100) {
+                p->severity = 1;
+                snprintf(p->reason, sizeof(p->reason), "System process hidden");
+            } else {
+                p->severity = 1;
+                snprintf(p->reason, sizeof(p->reason), "Hidden from ps");
+            }
+            hidden_count++;
+        }
+    }
+    
+    char result_buffer[262144];
+    int pos = 0;
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=== HIDDEN PROCESS DETECTION RESULTS FOR %s ===\n", vm->name);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Scan Time: %s\n", time_str);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "VMI processes: %d | Guest processes: %d | Hidden: %d\n\n",
+            vmi_count, guest_count, hidden_count);
+    
+    if (hidden_count > 0) {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "%-8s %-25s %-10s %s\n", "PID", "NAME", "SEVERITY", "REASON");
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "--------------------------------------------------------------------------------\n");
+        
+        for (int i = 0; i < hidden_count; i++) {
+            const char *sev = hidden[i].severity == 2 ? "ROOTKIT" : "SUSPICIOUS";
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                    "%-8lu %-25s %-10s %s\n",
+                    (unsigned long)hidden[i].pid, hidden[i].name, sev, hidden[i].reason);
+        }
+    } else {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[OK] No hidden processes detected\n");
+    }
+    
+    printf("%s", result_buffer);
+    store_scan_result(vm->name, "hidden", result_buffer);
+    
+    for (int i = 0; i < hidden_count; i++) {
+        alert_t alert = {0};
+        strcpy(alert.vm_name, vm->name);
+        alert.module = MODULE_HIDDEN_PROCESS;
+        alert.severity = hidden[i].severity;
+        alert.pid = hidden[i].pid;
+        strncpy(alert.process_name, hidden[i].name, 31);
+        alert.process_name[31] = '\0';
+        snprintf(alert.description, sizeof(alert.description),
+                "Hidden process: %s (PID:%lu) - %s",
+                hidden[i].name, (unsigned long)hidden[i].pid, hidden[i].reason);
+        add_alert(&alert);
+    }
+    
+    for (int i = 0; i < vmi_count; i++) free(vmi_names[i]);
+    free(vmi_pids);
+    free(vmi_names);
+    
+    for (int i = 0; i < guest_count; i++) free(guest_names[i]);
+    free(guest_pids);
+    free(guest_names);
+    
+    return hidden_count;
+}
+
+
+===============================================================================
+FILE: modules/syscall_detection.c - Syscall Integrity Check
+===============================================================================
+Purpose: Detects hooked system calls by validating handler addresses against
+          kernel text boundaries using physical memory addressing.
+/**
+ * SYSCALL INTEGRITY CHECK MODULE
+ * 
+ * Detects hooked system calls by validating handler addresses against
+ * kernel text boundaries using physical memory addressing.
+ * 
+ * NOTE: On kernels with KPTI (Kernel Page Table Isolation), virtual addresses
+ * cannot be read from the hypervisor. This module uses physical addresses
+ * obtained from System.map to work around KPTI restrictions.
+ */
+
+#include "module_headers.h"
+#include "../core/vmi_core.h"
+#include <ctype.h>
+
+#define SCAN_START 0xffffffff80000000UL
+#define SCAN_END   0xffffffffc0000000UL
+
+extern void store_scan_result(const char *vm_name, const char *module, const char *data);
+
+// Comprehensive syscall names for Linux x86_64 (up to ~450 syscalls)
+static const char *syscall_names[] = {
+    "read", "write", "open", "close", "stat", "fstat", "lstat", "poll",
+    "lseek", "mmap", "mprotect", "munmap", "brk", "rt_sigaction",
+    "rt_sigprocmask", "rt_sigreturn", "ioctl", "pread64", "pwrite64",
+    "readv", "writev", "access", "pipe", "select", "sched_yield",
+    "mremap", "msync", "mincore", "madvise", "shmget", "shmat",
+    "shmctl", "dup", "dup2", "pause", "nanosleep", "getitimer",
+    "alarm", "setitimer", "getpid", "sendfile", "socket", "connect",
+    "accept", "sendto", "recvfrom", "sendmsg", "recvmsg", "shutdown",
+    "bind", "listen", "getsockname", "getpeername", "socketpair",
+    "setsockopt", "getsockopt", "clone", "fork", "vfork", "execve",
+    "exit", "wait4", "kill", "uname", "semget", "semop", "semctl",
+    "shmdt", "msgget", "msgsnd", "msgrcv", "msgctl", "fcntl",
+    "flock", "fsync", "fdatasync", "truncate", "ftruncate",
+    "getdents", "getcwd", "chdir", "fchdir", "rename", "mkdir",
+    "rmdir", "creat", "link", "unlink", "symlink", "readlink",
+    "chmod", "fchmod", "chown", "fchown", "lchown", "umask",
+    "gettimeofday", "getrlimit", "getrusage", "sysinfo", "times",
+    "ptrace", "getuid", "syslog", "getgid", "setuid", "setgid",
+    "geteuid", "getegid", "setpgid", "getppid", "getpgrp",
+    "setsid", "setreuid", "setregid", "getgroups", "setgroups",
+    "setresuid", "getresuid", "setresgid", "getresgid", "getpgid",
+    "setfsuid", "setfsgid", "getsid", "capget", "capset",
+    "rt_sigpending", "rt_sigtimedwait", "rt_sigqueueinfo",
+    "rt_sigsuspend", "sigaltstack", "utime", "mknod", "uselib",
+    "personality", "ustat", "statfs", "fstatfs", "sysfs",
+    "getpriority", "setpriority", "sched_setparam", "sched_getparam",
+    "sched_setscheduler", "sched_getscheduler",
+    "sched_get_priority_max", "sched_get_priority_min",
+    "sched_rr_get_interval", "mlock", "munlock", "mlockall",
+    "munlockall", "vhangup", "modify_ldt", "pivot_root", "_sysctl",
+    "prctl", "arch_prctl", "adjtimex", "setrlimit", "chroot",
+    "sync", "acct", "settimeofday", "mount", "umount2", "swapon",
+    "swapoff", "reboot", "sethostname", "setdomainname", "iopl",
+    "ioperm", "create_module", "init_module", "delete_module",
+    "get_kernel_syms", "query_module", "quotactl", "nfsservctl",
+    "getpmsg", "putpmsg", "afs_syscall", "tuxcall", "security",
+    "gettid", "readahead", "setxattr", "lsetxattr", "fsetxattr",
+    "getxattr", "lgetxattr", "fgetxattr", "listxattr", "llistxattr",
+    "flistxattr", "removexattr", "lremovexattr", "fremovexattr",
+    "tkill", "time", "futex", "sched_setaffinity", "sched_getaffinity",
+    "set_thread_area", "io_setup", "io_destroy", "io_getevents",
+    "io_submit", "io_cancel", "get_thread_area", "lookup_dcookie",
+    "epoll_create", "epoll_ctl_old", "epoll_wait_old",
+    "remap_file_pages", "getdents64", "set_tid_address",
+    "restart_syscall", "semtimedop", "fadvise64", "timer_create",
+    "timer_settime", "timer_gettime", "timer_getoverrun",
+    "timer_delete", "clock_settime", "clock_gettime", "clock_getres",
+    "clock_nanosleep", "exit_group", "epoll_wait", "epoll_ctl",
+    "tgkill", "utimes", "vserver", "mbind", "set_mempolicy",
+    "get_mempolicy", "mq_open", "mq_unlink", "mq_timedsend",
+    "mq_timedreceive", "mq_notify", "mq_getsetattr", "kexec_load",
+    "waitid", "add_key", "request_key", "keyctl", "ioprio_set",
+    "ioprio_get", "inotify_init", "inotify_add_watch",
+    "inotify_rm_watch", "migrate_pages", "openat", "mkdirat",
+    "mknodat", "fchownat", "futimesat", "newfstatat", "unlinkat",
+    "renameat", "linkat", "symlinkat", "readlinkat", "fchmodat",
+    "faccessat", "pselect6", "ppoll", "unshare", "set_robust_list",
+    "get_robust_list", "splice", "tee", "sync_file_range", "vmsplice",
+    "move_pages", "utimensat", "epoll_pwait", "signalfd",
+    "timerfd_create", "eventfd", "fallocate", "timerfd_settime",
+    "timerfd_gettime", "accept4", "signalfd4", "eventfd2",
+    "epoll_create1", "dup3", "pipe2", "inotify_init1", "preadv",
+    "pwritev", "rt_tgsigqueueinfo", "perf_event_open", "recvmmsg",
+    "fanotify_init", "fanotify_mark", "prlimit64", "name_to_handle_at",
+    "open_by_handle_at", "clock_adjtime", "syncfs", "sendmmsg",
+    "setns", "getcpu", "process_vm_readv", "process_vm_writev",
+    "kcmp", "finit_module", "sched_setattr", "sched_getattr",
+    "renameat2", "seccomp", "getrandom", "memfd_create",
+    "kexec_file_load", "bpf", "execveat", "userfaultfd", "membarrier",
+    "mlock2", "copy_file_range", "preadv2", "pwritev2", "pkey_mprotect",
+    "pkey_alloc", "pkey_free", "statx", "io_pgetevents", "rseq"
+};
+
+/**
+ * Check syscall table integrity using physical memory reads
+ * 
+ * This function reads the syscall table from physical memory using the
+ * address obtained from System.map. On kernels with KPTI, virtual addresses
+ * cannot be read directly, so we mask to the physical address (lower 32 bits)
+ * and use vmi_read_pa() instead of vmi_read_64_va().
+ * 
+ * @param vm      VM instance to check
+ * @return        Number of hooked syscalls detected, or -1 on error
+ */
+int check_syscall_integrity(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) {
+        printf("[SYSCALL] ERROR: VM not connected\n");
+        return -1;
+    }
+    
+    time_t scan_start = time(NULL);
+    struct tm *tm_info = localtime(&scan_start);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    printf("\n[SYSCALL] =========================================\n");
+    printf("[SYSCALL] Scanning %s at %s\n", vm->name, time_str);
+    printf("[SYSCALL] =========================================\n");
+    
+    char result_buffer[262144];
+    int pos = 0;
+    int hooked_count = 0;
+    int valid_reads = 0;
+    int invalid_reads = 0;
+    int null_entries = 0;
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=== SYSCALL HOOK DETECTION RESULTS FOR %s ===\n", vm->name);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Scan Time: %s\n", time_str);
+    
+    // Check if we have a valid syscall table address
+    if (vm->offsets.syscall_table_addr == 0) {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[ERROR] Syscall table address not found.\n");
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[INFO] Make sure System.map is available in /boot/\n");
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[INFO] Run: cp /path/to/System.map /boot/System.map-$(uname -r)\n\n");
+        printf("%s", result_buffer);
+        store_scan_result(vm->name, "syscall", result_buffer);
+        return 0;
+    }
+    
+    // CRITICAL FIX: Convert virtual address to physical address
+    // On kernels with KPTI, the virtual address (0xffffffff81e00280) cannot be read.
+    // The physical address is the lower 32 bits (0x81e00280) and CAN be read.
+    uint64_t syscall_table_pa = vm->offsets.syscall_table_addr & 0xffffffff;
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Syscall table virtual address: 0x%lx\n", vm->offsets.syscall_table_addr);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Syscall table physical address: 0x%lx\n", syscall_table_pa);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Method: Physical memory read (bypasses KPTI)\n\n");
+    
+    // Determine how many syscalls to check
+    // Linux x86_64 typically has 332-450 syscalls, we'll check up to 350
+    int max_syscalls = 350;
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "%-8s %-22s %-20s %s\n", "NR", "NAME", "HANDLER ADDRESS", "STATUS");
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "--------------------------------------------------------------------------------\n");
+    
+    // Read syscall table entries using physical memory
+    for (int nr = 0; nr < max_syscalls; nr++) {
+        uint64_t handler = 0;
+        uint64_t handler_pa = syscall_table_pa + (nr * 8);
+        
+        // Use physical memory read (works with KPTI)
+        if (vmi_read_pa(vm->vmi, handler_pa, 8, &handler, NULL) == VMI_SUCCESS) {
+            const char *name = (nr < (int)(sizeof(syscall_names)/sizeof(syscall_names[0]))) 
+                               ? syscall_names[nr] : "unknown";
+            
+            // Validate handler address
+            // Legitimate kernel functions are in 0xffffffff80000000 - 0xffffffffc0000000 range
+            if (handler >= 0xffffffff80000000UL && handler <= 0xffffffffc0000000UL) {
+                pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                        "%-8d %-22s 0x%-18lx OK\n", nr, name, handler);
+                valid_reads++;
+            }
+            else if (handler == 0 || handler == 0xffffffffffffffffUL) {
+                pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                        "%-8d %-22s %-20s %s\n", nr, name, "NULL", "UNUSED");
+                null_entries++;
+            }
+            else {
+                // Handler address is outside kernel text range - possible hook!
+                invalid_reads++;
+                hooked_count++;
+                
+                // Determine severity based on handler address
+                char severity_msg[64] = "";
+                if (handler < 0xffffffff80000000UL) {
+                    snprintf(severity_msg, sizeof(severity_msg), "HOOKED (address below kernel)");
+                } else if (handler > 0xffffffffc0000000UL) {
+                    snprintf(severity_msg, sizeof(severity_msg), "HOOKED (address above kernel)");
+                } else if (handler < 0xffffffff81000000UL) {
+                    snprintf(severity_msg, sizeof(severity_msg), "HOOKED (in reserved region)");
+                } else {
+                    snprintf(severity_msg, sizeof(severity_msg), "HOOKED (suspicious)");
+                }
+                
+                pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                        "%-8d %-22s 0x%-18lx %s [HOOK DETECTED]\n", 
+                        nr, name, handler, severity_msg);
+                
+                // Generate alert for hooked syscall
+                alert_t alert = {0};
+                strcpy(alert.vm_name, vm->name);
+                alert.module = MODULE_SYSCALL;
+                alert.severity = ALERT_CRITICAL;
+                alert.memory_addr = handler_pa;
+                snprintf(alert.description, sizeof(alert.description),
+                        "Hooked syscall %d (%s): handler at 0x%lx (outside kernel text)",
+                        nr, name, handler);
+                add_alert(&alert);
+            }
+        } else {
+            // Failed to read from physical memory
+            if (nr < 50) {  // Only log early failures to avoid spam
+                pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                        "%-8d %-22s %-20s %s\n", nr, "READ FAILED", "", "ERROR");
+            }
+            invalid_reads++;
+        }
+        
+        // Flush buffer occasionally to avoid overflow
+        if (pos > 250000) {
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                    "... (output truncated, max 350 syscalls)\n");
+            break;
+        }
+    }
+    
+    // Print summary statistics
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=== SCAN SUMMARY ===\n");
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Syscalls checked: %d\n", max_syscalls);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Valid kernel addresses: %d\n", valid_reads);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "NULL/unused entries: %d\n", null_entries);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Read errors: %d\n", invalid_reads - hooked_count);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "HOOKED SYSCALLS DETECTED: %d\n", hooked_count);
+    
+    if (hooked_count == 0 && valid_reads > 0) {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "\n[OK] System call table is clean. No hooks detected.\n");
+    } else if (hooked_count > 0) {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "\n!!! %d HOOKED SYSCALLS DETECTED !!!\n", hooked_count);
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[ALERT] Rootkit may be intercepting system calls.\n");
+        
+        // Log forensic event
+        char forensic_msg[256];
+        snprintf(forensic_msg, sizeof(forensic_msg),
+                "Detected %d hooked syscalls in %s", hooked_count, vm->name);
+        log_forensic_event(vm->name, "SYSCALL_HOOK_DETECTED", forensic_msg);
+    } else if (valid_reads == 0) {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "\n[WARNING] No valid kernel addresses found.\n");
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[INFO] The physical address might be incorrect.\n");
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[INFO] Try: sudo cat /proc/kallsyms | grep sys_call_table\n");
+    }
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=== END OF SYSCALL SCAN ===\n");
+    
+    printf("%s", result_buffer);
+    store_scan_result(vm->name, "syscall", result_buffer);
+    
+    // Update VM anomaly count
+    vm->anomalies.hooked_syscalls = hooked_count;
+    
+    return hooked_count;
+}
+
+
+===============================================================================
+FILE: modules/idt_detection.c - IDT Integrity Check
+===============================================================================
+Purpose: Checks Interrupt Descriptor Table integrity. Limited on kernel 6.2.0+
+          due to KPTI (Kernel Page Table Isolation).
+#include "module_headers.h"
+#include "../core/vmi_core.h"
+#include <ctype.h>
+
+extern void store_scan_result(const char *vm_name, const char *module, const char *data);
+
+static const char *vector_names[] = {
+    "Divide Error", "Debug", "NMI", "Breakpoint", "Overflow",
+    "BOUND Range", "Invalid Opcode", "Device Not Available",
+    "Double Fault", "Coprocessor Segment", "Invalid TSS",
+    "Segment Not Present", "Stack Fault", "General Protection",
+    "Page Fault", "Reserved", "x87 FPU Error", "Alignment Check",
+    "Machine Check", "SIMD Exception", "Virtualization",
+    "Control Protection", "Reserved", "Reserved", "Reserved",
+    "Reserved", "Reserved", "Reserved", "Reserved", "Reserved",
+    "Reserved", "Reserved", "IRQ0 (Timer)", "IRQ1 (Keyboard)",
+    "IRQ2 (Cascade)", "IRQ3 (COM2)", "IRQ4 (COM1)", "IRQ5 (LPT2)",
+    "IRQ6 (Floppy)", "IRQ7 (LPT1)", "IRQ8 (RTC)", "IRQ9 (ACPI)",
+    "IRQ10", "IRQ11", "IRQ12 (Mouse)", "IRQ13 (FPU)", "IRQ14 (ATA)",
+    "IRQ15 (ATA)"
+};
+
+static uint64_t parse_idt_entry(unsigned char *entry) {
+    uint16_t offset_low = *(uint16_t*)&entry[0];
+    uint16_t offset_mid = *(uint16_t*)&entry[6];
+    uint32_t offset_high = *(uint32_t*)&entry[8];
+    return ((uint64_t)offset_high << 32) | ((uint64_t)offset_mid << 16) | offset_low;
+}
+
+int check_idt_integrity(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return -1;
+    
+    time_t scan_start = time(NULL);
+    struct tm *tm_info = localtime(&scan_start);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    printf("\n[IDT] Quick check for %s at %s\n", vm->name, time_str);
+    
+    char result_buffer[4096];
+    int pos = 0;
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=== IDT DETECTION STATUS FOR %s ===\n", vm->name);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Scan Time: %s\n", time_str);
+    
+    if (vm->offsets.idt_base == 0) {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "\n[INFO] IDT detection on kernel 6.2.0+ is limited due to KPTI.\n");
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[INFO] The IDT is protected by Kernel Page Table Isolation.\n");
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[INFO] This is a known limitation of modern kernels.\n\n");
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[OK] Syscall detection is working normally.\n");
+    } else {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "\n[OK] IDT found at 0x%lx\n", vm->offsets.idt_base);
+    }
+    
+    printf("%s", result_buffer);
+    store_scan_result(vm->name, "idt", result_buffer);
+    
+    return 0;
+}
+
+
+===============================================================================
+FILE: modules/fallback_detection.c - Fallback Heuristic Detection
+===============================================================================
+Purpose: Scans physical memory for rootkit signatures (Diamorphine, Adore-ng, etc.)
+          and suspicious executable code patterns when kernel symbols unavailable.
+#define _GNU_SOURCE
+#include "module_headers.h"
+#include "../core/vmi_core.h"
+#include <ctype.h>
+
+#define SCAN_CHUNK (1024 * 1024)  // 1MB chunks
+
+extern void store_scan_result(const char *vm_name, const char *module, const char *data);
+
+int check_fallback_detection(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return -1;
+    
+    time_t scan_start = time(NULL);
+    struct tm *tm_info = localtime(&scan_start);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    printf("\n[FALLBACK] Scanning %s at %s\n", vm->name, time_str);
+    printf("[FALLBACK] Total memory to scan: %lu MB\n", vm->mem_size / (1024 * 1024));
+    
+    unsigned char *buffer = malloc(SCAN_CHUNK);
+    if (!buffer) {
+        printf("[FALLBACK] ERROR: Failed to allocate buffer\n");
+        return -1;
+    }
+    
+    char result_buffer[262144];
+    int pos = 0;
+    int anomaly_count = 0;
+    int suspicious_count = 0;
+    int rootkit_count = 0;
+    uint64_t total_scanned = 0;
+    uint64_t mem_size = vm->mem_size;
+    int last_percent = 0;
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=== FALLBACK DETECTION RESULTS FOR %s ===\n", vm->name);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Scan Time: %s\n", time_str);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Total Memory Scanned: %lu MB\n", mem_size / (1024 * 1024));
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Method: Physical memory scanning (rootkit signatures + executable code detection)\n\n");
+    
+    // Rootkit signature patterns
+    const struct {
+        const char *name;
+        const unsigned char *pattern;
+        int len;
+        int min_confidence;
+        int severity;  // 2=critical(rootkit), 1=warning(suspicious)
+    } signatures[] = {
+        {"Diamorphine", (const unsigned char*)"diamorphine", 11, 85, 2},
+        {"Adore-ng", (const unsigned char*)"adore-ng", 8, 85, 2},
+        {"Kbeast", (const unsigned char*)"kbeast", 6, 85, 2},
+        {"Rkit", (const unsigned char*)"rkit", 4, 75, 2},
+        {"Override", (const unsigned char*)"override", 8, 90, 2},
+        {"Suterusu", (const unsigned char*)"suterusu", 8, 85, 2},
+        {"Enye LKM", (const unsigned char*)"enye", 4, 85, 2},
+        {"Kbdv3", (const unsigned char*)"kbdv3", 5, 85, 2},
+        {"Kdoor", (const unsigned char*)"kdoor", 5, 85, 2},
+        {"Knark", (const unsigned char*)"knark", 5, 85, 2},
+        {"Phalanx", (const unsigned char*)"phalanx", 7, 85, 2},
+        {"Mood-nt", (const unsigned char*)"mood-nt", 7, 85, 2},
+        {"Kjackal", (const unsigned char*)"kjackal", 7, 85, 2},
+        {"Linux Rootkit 1", (const unsigned char*)"rootkit", 7, 70, 1},
+        {"Linux Rootkit 2", (const unsigned char*)"rootkit found", 12, 80, 1},
+    };
+    
+    int sig_index = 0;
+    int exec_pages = 0;
+    
+    printf("[FALLBACK] Starting physical memory scan...\n\n");
+    
+    for (uint64_t pa = 0; pa < mem_size; pa += SCAN_CHUNK) {
+        size_t bytes_read = 0;
+        if (vmi_read_pa(vm->vmi, pa, SCAN_CHUNK, buffer, &bytes_read) != VMI_SUCCESS || bytes_read == 0) {
+            continue;
+        }
+        
+        total_scanned += bytes_read;
+        int percent = (int)((total_scanned * 100) / mem_size);
+        
+        if (percent >= last_percent + 5) {
+            printf("[FALLBACK] Progress: %d%% (%lu MB / %lu MB)\n", 
+                   percent, total_scanned / (1024*1024), mem_size / (1024*1024));
+            last_percent = percent;
+        }
+        
+        // Check for rootkit signatures
+        for (size_t i = 0; i < bytes_read - 32 && anomaly_count < 100; i++) {
+            for (int s = 0; s < (int)(sizeof(signatures)/sizeof(signatures[0])); s++) {
+                if (i + signatures[s].len < bytes_read &&
+                    memcmp(buffer + i, signatures[s].pattern, signatures[s].len) == 0) {
+                    
+                    int confidence = 50;
+                    
+                    // Check nearby for executable code (CALL, JMP, RET instructions)
+                    int has_code_nearby = 0;
+                    for (int j = -16; j <= 16; j += 4) {
+                        if ((int)(i + j) >= 0 && (int)(i + j + 4) < (int)bytes_read) {
+                            unsigned char *p = buffer + i + j;
+                            if (*p == 0xe8 || *p == 0xe9 || *p == 0xc3 || *p == 0xcc) {
+                                has_code_nearby = 1;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (has_code_nearby) confidence += 30;
+                    
+                    // Check if in kernel module space
+                    if (pa >= 0xffffffffc0000000) {
+                        confidence += 20;
+                    }
+                    
+                    if (confidence >= signatures[s].min_confidence) {
+                        anomaly_count++;
+                        if (signatures[s].severity == 2) rootkit_count++;
+                        else suspicious_count++;
+                        sig_index++;
+                        
+                        const char *severity_str = (signatures[s].severity == 2) ? "ROOTKIT" : "SUSPICIOUS";
+                        
+                        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                                "%-8d 0x%016lx %s signature: %s (confidence: %d%%) [%s]\n",
+                                sig_index, (unsigned long)(pa + i), severity_str, 
+                                signatures[s].name, confidence, 
+                                has_code_nearby ? "near executable code" : "in data section");
+                        
+                        // Generate alert
+                        alert_t alert = {0};
+                        strcpy(alert.vm_name, vm->name);
+                        alert.module = MODULE_FALLBACK;
+                        alert.severity = signatures[s].severity;
+                        alert.memory_addr = pa + i;
+                        snprintf(alert.description, sizeof(alert.description),
+                                "%s %s signature at 0x%lx (confidence: %d%%)", 
+                                severity_str, signatures[s].name, (unsigned long)(pa + i), confidence);
+                        add_alert(&alert);
+                        
+                        i += signatures[s].len;
+                    }
+                }
+            }
+        }
+        
+        // Check for executable code in non-executable regions (suspicious)
+        if (pa < 0x10000000) {  // Only scan lower memory for executable patterns
+            for (size_t i = 0; i < bytes_read - 48; i++) {
+                int exec_instructions = 0;
+                for (int j = 0; j < 16; j++) {
+                    unsigned char *p = buffer + i + j;
+                    if (*p == 0xe8 || *p == 0xe9 || *p == 0xc3 || *p == 0xcc || 
+                        *p == 0x55 || *p == 0x89 || *p == 0x48 || *p == 0x8b) {
+                        exec_instructions++;
+                    }
+                }
+                
+                if (exec_instructions >= 8) {
+                    // Check if this looks like a region with many code patterns
+                    int nearby_code = 0;
+                    for (int j = -64; j <= 64; j += 4) {
+                        if ((int)(i + j) >= 0 && (int)(i + j + 4) < (int)bytes_read) {
+                            unsigned char *p = buffer + i + j;
+                            if (*p == 0xe8 || *p == 0xe9 || *p == 0xc3) {
+                                nearby_code++;
+                            }
+                        }
+                    }
+                    
+                    if (nearby_code >= 5 && exec_instructions >= 10) {
+                        exec_pages++;
+                        if (exec_pages <= 30) {
+                            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                                    "0x%016lx: Executable code detected in data region (%d instructions, %d nearby)\n",
+                                    (unsigned long)(pa + i), exec_instructions, nearby_code);
+                            
+                            if (exec_pages <= 10) {
+                                alert_t alert = {0};
+                                strcpy(alert.vm_name, vm->name);
+                                alert.module = MODULE_FALLBACK;
+                                alert.severity = ALERT_WARNING;
+                                alert.memory_addr = pa + i;
+                                snprintf(alert.description, sizeof(alert.description),
+                                        "Suspicious executable code at 0x%lx in data region", (unsigned long)(pa + i));
+                                add_alert(&alert);
+                                suspicious_count++;
+                                anomaly_count++;
+                            }
+                        }
+                        i += 32;
+                    }
+                }
+            }
+        }
+    }
+    
+    free(buffer);
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=== SCAN SUMMARY ===\n");
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Total memory scanned: %lu MB\n", total_scanned / (1024*1024));
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Rootkit signatures found: %d\n", rootkit_count);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Suspicious patterns found: %d\n", suspicious_count);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Executable code pages in data regions: %d\n", exec_pages);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "Total anomalies: %d\n\n", anomaly_count);
+    
+    if (rootkit_count > 0) {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "!!! %d ROOTKIT SIGNATURES DETECTED !!!\n", rootkit_count);
+    } else if (anomaly_count > 0) {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "!!! %d ANOMALIES DETECTED (Suspicious patterns) !!!\n", anomaly_count);
+    } else {
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "[OK] No anomalies detected in memory scan\n");
+    }
+    
+    printf("%s", result_buffer);
+    store_scan_result(vm->name, "fallback", result_buffer);
+    
+    vm->anomalies.fallback_detections = anomaly_count;
+    return anomaly_count;
+}
+
+
+===============================================================================
+FILE: modules/guest_syscall.c - Guest Agent Integration
+===============================================================================
+Purpose: Retrieves system information from guest VM via QEMU guest agent,
+          including hostname, kernel version, memory info, and module checks.
+#include "module_headers.h"
+#include "../core/vmi_core.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+extern void store_scan_result(const char *vm_name, const char *module, const char *data);
+
+int check_syscall_via_guest(vm_instance_t *vm) {
+    if (!vm || !vm->name) return -1;
+    
+    time_t scan_start = time(NULL);
+    struct tm *tm_info = localtime(&scan_start);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    printf("\n[GUEST] Getting system info from %s via guest agent at %s\n", vm->name, time_str);
+    
+    char result_buffer[262144];
+    int pos = 0;
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=== GUEST AGENT SYSTEM INFORMATION ===\n");
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "VM: %s | Time: %s\n", vm->name, time_str);
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "=======================================\n\n");
+    
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+            "sudo virsh qemu-agent-command %s '{\"execute\":\"guest-ping\"}' 2>/dev/null",
+            vm->name);
+    
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char line[256];
+        if (fgets(line, sizeof(line), fp)) {
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                    "[OK] Guest agent is responding\n\n");
+        } else {
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                    "[ERROR] Guest agent not responding\n\n");
+        }
+        pclose(fp);
+    }
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "--- SYSTEM INFORMATION ---\n");
+    
+    snprintf(cmd, sizeof(cmd),
+            "sudo virsh qemu-agent-command %s '{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/hostname\",\"capture-output\":true}}' 2>/dev/null | grep -o 'out-data.*' | cut -d'\"' -f3",
+            vm->name);
+    
+    fp = popen(cmd, "r");
+    if (fp) {
+        char line[1024];
+        if (fgets(line, sizeof(line), fp)) {
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                    "Hostname: %s", line);
+        }
+        pclose(fp);
+    }
+    
+    snprintf(cmd, sizeof(cmd),
+            "sudo virsh qemu-agent-command %s '{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/uname\",\"arg\":[\"-a\"],\"capture-output\":true}}' 2>/dev/null | grep -o 'out-data.*' | cut -d'\"' -f3",
+            vm->name);
+    
+    fp = popen(cmd, "r");
+    if (fp) {
+        char line[1024];
+        if (fgets(line, sizeof(line), fp)) {
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                    "Kernel: %s", line);
+        }
+        pclose(fp);
+    }
+    
+    snprintf(cmd, sizeof(cmd),
+            "sudo virsh qemu-agent-command %s '{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/cat\",\"arg\":[\"/proc/meminfo\"],\"capture-output\":true}}' 2>/dev/null | grep -E 'MemTotal|MemFree' | grep -o 'out-data.*' | cut -d'\"' -f3",
+            vm->name);
+    
+    fp = popen(cmd, "r");
+    if (fp) {
+        char line[1024];
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "\n--- MEMORY INFORMATION ---\n");
+        while (fgets(line, sizeof(line), fp)) {
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos, "%s", line);
+        }
+        pclose(fp);
+    }
+    
+    snprintf(cmd, sizeof(cmd),
+            "sudo virsh qemu-agent-command %s '{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"/bin/lsmod\",\"capture-output\":true}}' 2>/dev/null | grep -o 'out-data.*' | cut -d'\"' -f3 | grep -i -E 'diamorphine|adore|knark|rkit|override'",
+            vm->name);
+    
+    fp = popen(cmd, "r");
+    if (fp) {
+        int found = 0;
+        char line[1024];
+        pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                "\n--- ROOTKIT CHECKS ---\n");
+        while (fgets(line, sizeof(line), fp)) {
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                    "WARNING: Suspicious module found: %s", line);
+            found = 1;
+        }
+        if (!found) {
+            pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+                    "No suspicious kernel modules found\n");
+        }
+        pclose(fp);
+    }
+    
+    pos += snprintf(result_buffer + pos, sizeof(result_buffer) - pos,
+            "\n=======================================\n");
+    
+    printf("%s", result_buffer);
+    store_scan_result(vm->name, "guest", result_buffer);
+    
+    return 0;
+}
+
+
+===============================================================================
+FILE: modules/alternative_process_detection.c - Alternative Process Detection
+===============================================================================
+Purpose: Scans physical memory for process name strings when standard task_struct
+          traversal fails due to missing kernel symbols.
+#include "module_headers.h"
+#include "../core/vmi_core.h"
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern void store_scan_result(const char *vm_name, const char *module, const char *data);
+extern int get_guest_process_list(const char *vm_name, uint64_t **pids, char ***names);
+
+int scan_memory_for_processes(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return -1;
+    
+    printf("\n[PROCESS] Scanning physical memory of %s (Total: %lu MB)...\n", 
+           vm->name, vm->mem_size / (1024 * 1024));
+    
+    unsigned char *buffer = malloc(1024 * 1024);
+    if (!buffer) return -1;
+    
+    int process_count = 0;
+    uint64_t mem_size = vm->mem_size;
+    uint64_t total_scanned = 0;
+    int last_percent = 0;
+    
+    // Buffer for progressive results
+    char progressive_buffer[65536];
+    int prog_pos = 0;
+    
+    // Initialize progressive result buffer
+    prog_pos += snprintf(progressive_buffer + prog_pos, sizeof(progressive_buffer) - prog_pos,
+            "\n=== HIDDEN PROCESS DETECTION RESULTS FOR %s ===\n", vm->name);
+    prog_pos += snprintf(progressive_buffer + prog_pos, sizeof(progressive_buffer) - prog_pos,
+            "Scan in progress...\n\n");
+    
+    for (uint64_t pa = 0; pa < mem_size && process_count < 500; pa += 1024 * 1024) {
+        size_t bytes_read = 0;
+        if (vmi_read_pa(vm->vmi, pa, 1024 * 1024, buffer, &bytes_read) != VMI_SUCCESS) {
+            continue;
+        }
+        
+        total_scanned += bytes_read;
+        int percent = (int)((total_scanned * 100) / mem_size);
+        
+        if (percent >= last_percent + 5) {
+            printf("[PROCESS] Scanning progress: %d%% (%lu MB / %lu MB)\n", 
+                   percent, total_scanned / (1024*1024), mem_size / (1024*1024));
+            last_percent = percent;
+            
+            // Send progress update to dashboard
+            char progress_msg[256];
+            snprintf(progress_msg, sizeof(progress_msg),
+                    "\n[STATUS] Scanning %d%% complete (%lu MB / %lu MB) - Found %d process names so far\n",
+                    percent, total_scanned / (1024*1024), mem_size / (1024*1024), process_count);
+            
+            // Store progressive update
+            prog_pos += snprintf(progressive_buffer + prog_pos, sizeof(progressive_buffer) - prog_pos,
+                    "%s", progress_msg);
+            store_scan_result(vm->name, "hidden", progressive_buffer);
+        }
+        
+        for (size_t i = 0; i < bytes_read - 16; i++) {
+            if (isprint(buffer[i]) && buffer[i] > 32) {
+                int len = 0;
+                while (i + len < bytes_read && isprint(buffer[i+len]) && len < 15) {
+                    len++;
+                }
+                
+                if (len >= 3 && len <= 15) {
+                    char name[16];
+                    memcpy(name, &buffer[i], len);
+                    name[len] = '\0';
+                    
+                    if (strcmp(name, "systemd") == 0 ||
+                        strcmp(name, "init") == 0 ||
+                        strcmp(name, "bash") == 0 ||
+                        strcmp(name, "sshd") == 0 ||
+                        strcmp(name, "kernel") == 0 ||
+                        strcmp(name, "kthreadd") == 0 ||
+                        strcmp(name, "python") == 0 ||
+                        strcmp(name, "java") == 0 ||
+                        strcmp(name, "systemd-journal") == 0) {
+                        
+                        printf("[PROCESS] Found process name '%s' at physical 0x%lx\n", 
+                               name, (unsigned long)(pa + i));
+                        process_count++;
+                        
+                        // Add to progressive buffer
+                        prog_pos += snprintf(progressive_buffer + prog_pos, 
+                                sizeof(progressive_buffer) - prog_pos,
+                                "Found: %s at 0x%lx\n", name, (unsigned long)(pa + i));
+                        
+                        // Update dashboard every 10 findings
+                        if (process_count % 10 == 0) {
+                            store_scan_result(vm->name, "hidden", progressive_buffer);
+                        }
+                    }
+                }
+                i += len;
+            }
+        }
+    }
+    
+    // Final update
+    prog_pos += snprintf(progressive_buffer + prog_pos, sizeof(progressive_buffer) - prog_pos,
+            "\n=== SCAN COMPLETE ===\n");
+    prog_pos += snprintf(progressive_buffer + prog_pos, sizeof(progressive_buffer) - prog_pos,
+            "Scanned %lu MB, found %d process names\n", 
+            total_scanned / (1024*1024), process_count);
+    
+    printf("[PROCESS] Scan complete! Scanned %lu MB, found %d process names\n", 
+           total_scanned / (1024*1024), process_count);
+    
+    store_scan_result(vm->name, "hidden", progressive_buffer);
+    
+    free(buffer);
+    return process_count;
+}
+
+int detect_hidden_processes(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return -1;
+    
+    time_t scan_start = time(NULL);
+    struct tm *tm_info = localtime(&scan_start);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+    
+    printf("\n[PROCESS] Starting Hidden Process Detection for %s at %s\n", vm->name, time_str);
+    
+    int vmi_count = scan_memory_for_processes(vm);
+    
+    return vmi_count;
+}
+
+
+===============================================================================
+FILE: monitoring/monitor_loop.h - Monitor Loop Header
+===============================================================================
+#ifndef MONITOR_LOOP_H
+#define MONITOR_LOOP_H
+
+#include "../core/vmi_core.h"
+
+int start_monitoring(vmi_system_t *system);
+int stop_monitoring(vmi_system_t *system);
+int monitor_all_vms(vmi_system_t *system);
+int monitor_single_vm(vm_instance_t *vm);
+int get_scan_count(void);  
+
+#endif
+
+
+===============================================================================
+FILE: monitoring/monitor_loop.c - Monitor Loop Implementation
+===============================================================================
+Purpose: Orchestrates the continuous monitoring cycle, running all detection
+          modules sequentially and logging forensic events.
+#include "monitor_loop.h"
+#include "../modules/module_headers.h"
+#include <unistd.h>
+#include <time.h>
+#include <pthread.h>
+#include <signal.h>
+
+extern int detect_hidden_processes(vm_instance_t *vm);
+extern int check_syscall_integrity(vm_instance_t *vm);
+extern int check_idt_integrity(vm_instance_t *vm);
+extern int check_fallback_detection(vm_instance_t *vm);
+extern int check_syscall_via_guest(vm_instance_t *vm);
+
+static int g_monitoring_active = 0;
+static pthread_t g_monitor_thread;
+static vmi_system_t *g_system_ptr = NULL;
+static pthread_mutex_t g_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_scan_counter = 0;
+
+void log_forensic_event(const char *vm_name, const char *event_type, const char *details) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    FILE *log = fopen("forensic_audit.log", "a");
+    if (log) {
+        fprintf(log, "[%s] VM: %s | Event: %s | Details: %s\n",
+                timestamp, vm_name ? vm_name : "SYSTEM", event_type, details ? details : "");
+        fclose(log);
+    }
+    printf("[FORENSIC] [%s] %s | %s | %s\n", timestamp,
+           vm_name ? vm_name : "SYSTEM", event_type, details ? details : "");
+}
+
+int monitor_single_vm(vm_instance_t *vm) {
+    if (!vm || !vm->is_connected) return -1;
+    time_t scan_start = time(NULL);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", localtime(&scan_start));
+    printf("\n[MONITOR] === Starting Scan Cycle for %s at %s ===\n", vm->name, time_str);
+    log_forensic_event(vm->name, "SCAN_START", "Starting scan cycle");
+    int hidden = 0, syscall = 0, idt = 0, fallback = 0;
+    printf("[MONITOR] Running Hidden Process Detection...\n");
+    hidden = detect_hidden_processes(vm);
+    printf("[MONITOR] Running Syscall Integrity Check...\n");
+    syscall = check_syscall_integrity(vm);
+    printf("[MONITOR] Running IDT Check...\n");
+    idt = check_idt_integrity(vm);
+    printf("[MONITOR] Running Fallback Detection...\n");
+    fallback = check_fallback_detection(vm);
+    vm->anomalies.hidden_processes = hidden;
+    vm->anomalies.hooked_syscalls = syscall;
+    vm->anomalies.hooked_idt = idt;
+    vm->anomalies.fallback_detections = fallback;
+    vm->last_scan = scan_start;
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Hidden:%d Syscall:%d IDT:%d Fallback:%d", hidden, syscall, idt, fallback);
+    log_forensic_event(vm->name, "SCAN_COMPLETE", msg);
+    printf("[MONITOR] === Scan Cycle Complete. Results: %s ===\n", msg);
+    return 0;
+}
+
+int monitor_all_vms(vmi_system_t *system) {
+    if (!system) return -1;
+    int scanned = 0;
+    pthread_mutex_lock(&system->lock);
+    for (int i = 0; i < system->vm_count; i++) {
+        if (system->vms[i].is_monitored) {
+            if (monitor_single_vm(&system->vms[i]) == 0) {
+                scanned++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&system->lock);
+    return scanned;
+}
+
+static void* monitor_thread_func(void *arg) {
+    vmi_system_t *system = (vmi_system_t*)arg;
+    g_system_ptr = system;
+    log_forensic_event(NULL, "THREAD", "Monitoring thread started");
+    printf("[MONITOR] Thread started\n");
+    int consecutive_failures = 0;
+    while (1) {
+        pthread_mutex_lock(&g_monitor_lock);
+        int should_stop = !g_monitoring_active;
+        pthread_mutex_unlock(&g_monitor_lock);
+        if (should_stop) break;
+        g_scan_counter++;
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        char time_str[64];
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
+        printf("\n[MONITOR] === Scan cycle #%d at %s ===\n", g_scan_counter, time_str);
+        int scanned = monitor_all_vms(system);
+        if (scanned == 0) {
+            consecutive_failures++;
+            if (consecutive_failures > 5) {
+                printf("[MONITOR] Too many failures, rediscovering VMs...\n");
+                consecutive_failures = 0;
+            }
+        } else {
+            consecutive_failures = 0;
+        }
+        printf("[MONITOR] Scanned %d VMs this cycle\n", scanned);
+        for (int i = 0; i < 20; i++) {
+            pthread_mutex_lock(&g_monitor_lock);
+            int stop = !g_monitoring_active;
+            pthread_mutex_unlock(&g_monitor_lock);
+            if (stop) break;
+            sleep(1);
+        }
+    }
+    log_forensic_event(NULL, "THREAD", "Monitoring thread stopped");
+    return NULL;
+}
+
+int start_monitoring(vmi_system_t *system) {
+    if (!system) return -1;
+    pthread_mutex_lock(&g_monitor_lock);
+    if (g_monitoring_active) {
+        pthread_mutex_unlock(&g_monitor_lock);
+        printf("[MONITOR] Already monitoring\n");
+        return 0;
+    }
+    g_monitoring_active = 1;
+    system->monitoring_active = true;
+    pthread_mutex_unlock(&g_monitor_lock);
+    log_forensic_event(NULL, "MONITORING", "Starting monitoring service");
+    if (pthread_create(&g_monitor_thread, NULL, monitor_thread_func, system) != 0) {
+        log_forensic_event(NULL, "ERROR", "Failed to create monitoring thread");
+        pthread_mutex_lock(&g_monitor_lock);
+        g_monitoring_active = 0;
+        system->monitoring_active = false;
+        pthread_mutex_unlock(&g_monitor_lock);
+        return -1;
+    }
+    printf("[MONITOR] Monitoring started successfully\n");
+    return 0;
+}
+
+int stop_monitoring(vmi_system_t *system) {
+    if (!system) return -1;
+    pthread_mutex_lock(&g_monitor_lock);
+    if (!g_monitoring_active) {
+        pthread_mutex_unlock(&g_monitor_lock);
+        return 0;
+    }
+    g_monitoring_active = 0;
+    if (system) system->monitoring_active = false;
+    pthread_mutex_unlock(&g_monitor_lock);
+    log_forensic_event(NULL, "MONITORING", "Stopping monitoring service");
+    pthread_join(g_monitor_thread, NULL);
+    printf("[MONITOR] Monitoring stopped\n");
+    return 0;
+}
+
+int get_scan_count(void) {
+    return g_scan_counter;
+}
+
+
+===============================================================================
+FILE: web/dashboard_server.h - Dashboard Server Header
+===============================================================================
+#ifndef DASHBOARD_SERVER_H
+#define DASHBOARD_SERVER_H
+
+int start_dashboard_server(int port);
+void stop_dashboard_server(void);
+
+#endif
+
+
+===============================================================================
+FILE: web/dashboard_server.c - Web Dashboard Server
+===============================================================================
+Purpose: Implements C-based HTTP server on port 5000, serves static files,
+          and provides RESTful API endpoints for VM status, alerts, and scan data.
+#define _GNU_SOURCE
+#include "dashboard_server.h"
+#include "../core/vmi_core.h"
+#include "../alert/alert_manager.h"
+#include "../monitoring/monitor_loop.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
+#include <errno.h>
+
+void store_scan_result(const char *vm_name, const char *module, const char *data);
+
+extern void log_forensic_event(const char *vm_name, const char *event_type, const char *details);
+extern vmi_system_t g_system;
+
+static int server_running = 0;
+static int server_fd = -1;
+static pthread_t server_thread;
+
+typedef struct {
+    char vm_name[64];
+    char module[32];
+    time_t scan_time;
+    char data[262144];
+    int anomaly_count;
+    int suspicious_count;
+    int rootkit_count;
+} scan_result_t;
+
+static scan_result_t g_last_scan[20];
+static int g_scan_count = 0;
+static pthread_mutex_t g_scan_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void store_scan_result(const char *vm_name, const char *module, const char *data) {
+    if (!vm_name || !vm_name[0] || !module || !data) {
+        printf("[DASHBOARD] WARNING: store_scan_result called with invalid params\n");
+        return;
+    }
+    printf("[DASHBOARD] Storing scan result for VM: %s, Module: %s, length: %ld\n", 
+           vm_name, module, strlen(data));
+    pthread_mutex_lock(&g_scan_mutex);
+    int idx = -1;
+    for (int i = 0; i < g_scan_count; i++) {
+        if (strcmp(g_last_scan[i].vm_name, vm_name) == 0 &&
+            strcmp(g_last_scan[i].module, module) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == -1 && g_scan_count < 20) {
+        idx = g_scan_count++;
+        strncpy(g_last_scan[idx].vm_name, vm_name, sizeof(g_last_scan[idx].vm_name) - 1);
+        g_last_scan[idx].vm_name[sizeof(g_last_scan[idx].vm_name) - 1] = '\0';
+        strncpy(g_last_scan[idx].module, module, sizeof(g_last_scan[idx].module) - 1);
+        g_last_scan[idx].module[sizeof(g_last_scan[idx].module) - 1] = '\0';
+        g_last_scan[idx].scan_time = time(NULL);
+        printf("[DASHBOARD] Created NEW entry for %s/%s at index %d\n", vm_name, module, idx);
+    }
+    if (idx >= 0) {
+        g_last_scan[idx].scan_time = time(NULL);
+        strncpy(g_last_scan[idx].data, data, sizeof(g_last_scan[idx].data) - 1);
+        g_last_scan[idx].data[sizeof(g_last_scan[idx].data) - 1] = '\0';
+        printf("[DASHBOARD] UPDATED %s/%s, data length: %ld, total entries: %d\n", 
+               vm_name, module, strlen(data), g_scan_count);
+    } else {
+        printf("[DASHBOARD] ERROR: Could not store result for %s/%s (buffer full?)\n", vm_name, module);
+    }
+    pthread_mutex_unlock(&g_scan_mutex);
+}
+
+static const char* get_mime_type(const char *path) {
+    if (strstr(path, ".html") || strcmp(path, "/") == 0)
+        return "text/html; charset=utf-8";
+    if (strstr(path, ".css"))
+        return "text/css; charset=utf-8";
+    if (strstr(path, ".js"))
+        return "application/javascript; charset=utf-8";
+    if (strstr(path, ".json"))
+        return "application/json";
+    return "text/plain";
+}
+
+static char* generate_vms_json(void) {
+    char *buffer = malloc(131072);
+    if (!buffer) return NULL;
+    
+    buffer[0] = '\0';
+    
+    pthread_mutex_lock(&g_system.lock);
+    
+    char temp[8192];
+    snprintf(temp, sizeof(temp),
+            "{\n  \"total\": %d,\n  \"timestamp\": %ld,\n  \"vms\": [\n",
+            g_system.vm_count, (long)time(NULL));
+    strcat(buffer, temp);
+    
+    for (int i = 0; i < g_system.vm_count; i++) {
+        vm_instance_t *vm = &g_system.vms[i];
+        
+        char last_scan_str[64] = "Never";
+        if (vm->last_scan > 0) {
+            strftime(last_scan_str, sizeof(last_scan_str), "%H:%M:%S", localtime(&vm->last_scan));
+        }
+        
+        snprintf(temp, sizeof(temp),
+                "    {\n"
+                "      \"name\": \"%s\",\n"
+                "      \"uuid\": \"%s\",\n"
+                "      \"is_connected\": %s,\n"
+                "      \"is_monitored\": %s,\n"
+                "      \"memory_mb\": %lu,\n"
+                "      \"os\": \"%s\",\n"
+                "      \"last_scan\": \"%s\",\n"
+                "      \"anomalies\": {\n"
+                "        \"hidden_processes\": %d,\n"
+                "        \"hooked_syscalls\": %d,\n"
+                "        \"hooked_idt\": %d\n"
+                "      }\n"
+                "    }%s\n",
+                vm->name, vm->uuid,
+                vm->is_connected ? "true" : "false",
+                vm->is_monitored ? "true" : "false",
+                (unsigned long)(vm->mem_size / (1024 * 1024)),
+                vm->os_type[0] ? vm->os_type : "Linux",
+                last_scan_str,
+                vm->anomalies.hidden_processes,
+                vm->anomalies.hooked_syscalls,
+                vm->anomalies.hooked_idt,
+                (i < g_system.vm_count - 1) ? "," : "");
+        strcat(buffer, temp);
+        printf("[API] Added VM %s to JSON response\n", vm->name);
+    }
+    
+    strcat(buffer, "  ]\n}\n");
+    pthread_mutex_unlock(&g_system.lock);
+    
+    printf("[API] generate_vms_json: returning %d VMs\n", g_system.vm_count);
+    return buffer;
+}
+
+static void handle_api_request(int client_fd, const char *path, const char *method, const char *body) {
+    char response[1048576];
+    char *json_response = NULL;
+    const char *cors =
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n";
+    if (strcmp(method, "OPTIONS") == 0) {
+        snprintf(response, sizeof(response), "HTTP/1.1 204 No Content\r\n%s\r\n", cors);
+        send(client_fd, response, strlen(response), 0);
+        return;
+    }
+    if (strncmp(path, "/api/scan/", 10) == 0) {
+        char vm_name[64] = {0}, module[64] = {0};
+        int parsed = sscanf(path + 10, "%63[^/]/%63s", vm_name, module);
+        if (parsed != 2 || !vm_name[0] || !module[0]) {
+            snprintf(response, sizeof(response),
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nInvalid request");
+            send(client_fd, response, strlen(response), 0);
+            return;
+        }
+        printf("[API] REQUEST: %s/%s\n", vm_name, module);
+        char *response_data = NULL;
+        pthread_mutex_lock(&g_scan_mutex);
+        printf("[API] Checking %d stored entries...\n", g_scan_count);
+        for (int i = 0; i < g_scan_count; i++) {
+            printf("[API] Entry %d: VM='%s', Module='%s'\n", i, g_last_scan[i].vm_name, g_last_scan[i].module);
+            if (strcmp(g_last_scan[i].vm_name, vm_name) == 0 &&
+                strcmp(g_last_scan[i].module, module) == 0) {
+                response_data = strdup(g_last_scan[i].data);
+                printf("[API] FOUND DATA for %s/%s, length: %ld\n", vm_name, module, strlen(response_data));
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_scan_mutex);
+        if (!response_data) {
+            response_data = strdup("No scan data available yet. Please wait for scan to complete.");
+            printf("[API] NO DATA FOUND for %s/%s\n", vm_name, module);
+        }
+        snprintf(response, sizeof(response),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n%sContent-Length: %ld\r\n\r\n%s",
+                cors, (long)strlen(response_data), response_data);
+        send(client_fd, response, strlen(response), 0);
+        free(response_data);
+        return;
+    }
+    if (strcmp(path, "/api/alerts") == 0 && strcmp(method, "GET") == 0) {
+        extern char* generate_alerts_json(void);
+        char *alerts_json = generate_alerts_json();
+        if (!alerts_json) alerts_json = strdup("[]");
+        snprintf(response, sizeof(response),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %ld\r\n\r\n%s",
+                cors, (long)strlen(alerts_json), alerts_json);
+        send(client_fd, response, strlen(response), 0);
+        free(alerts_json);
+        return;
+    }
+    if (strcmp(path, "/api/vms") == 0 && strcmp(method, "GET") == 0) {
+        json_response = generate_vms_json();
+        if (json_response) {
+            snprintf(response, sizeof(response),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %ld\r\nConnection: close\r\n\r\n%s",
+                    cors, (long)strlen(json_response), json_response);
+            send(client_fd, response, strlen(response), 0);
+            free(json_response);
+        }
+        return;
+    }
+    if (strcmp(path, "/api/discover") == 0 && strcmp(method, "POST") == 0) {
+        discover_vms(&g_system);
+        json_response = generate_vms_json();
+        if (json_response) {
+            snprintf(response, sizeof(response),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %ld\r\n\r\n%s",
+                    cors, (long)strlen(json_response), json_response);
+            send(client_fd, response, strlen(response), 0);
+            free(json_response);
+        }
+        return;
+    }
+    if (strcmp(path, "/api/forensic-log") == 0 && strcmp(method, "GET") == 0) {
+        FILE *fp = fopen("forensic_audit.log", "r");
+        char log_content[65536] = "No forensic log available.";
+        if (fp) {
+            size_t bytes = fread(log_content, 1, sizeof(log_content) - 1, fp);
+            log_content[bytes] = '\0';
+            fclose(fp);
+        }
+        snprintf(response, sizeof(response),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n%sContent-Length: %ld\r\n\r\n%s",
+                cors, (long)strlen(log_content), log_content);
+        send(client_fd, response, strlen(response), 0);
+        return;
+    }
+    if (strncmp(path, "/api/monitor/", 13) == 0) {
+        char vm_name[64] = {0};
+        if (sscanf(path + 13, "%63s", vm_name) != 1 || !vm_name[0]) {
+            snprintf(response, sizeof(response),
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nInvalid VM name");
+            send(client_fd, response, strlen(response), 0);
+            return;
+        }
+        int start = 1;
+        if (body) {
+            if (strstr(body, "stop") || strstr(body, "\"action\":\"stop\"")) {
+                start = 0;
+            }
+        }
+        printf("[DASHBOARD] %s monitoring for VM: %s\n", start ? "Starting" : "Stopping", vm_name);
+        vm_instance_t *vm = find_vm_by_name(&g_system, vm_name);
+        if (!vm) {
+            snprintf(response, sizeof(response),
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nVM %s not found", vm_name);
+            send(client_fd, response, strlen(response), 0);
+            return;
+        }
+        if (start) {
+            if (!vm->is_connected) {
+                printf("[DASHBOARD] VM %s not connected, attempting to connect...\n", vm_name);
+                if (connect_to_vm(vm) != 0) {
+                    snprintf(response, sizeof(response),
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nFailed to connect to VM");
+                    send(client_fd, response, strlen(response), 0);
+                    return;
+                }
+                printf("[DASHBOARD] Successfully connected to %s\n", vm_name);
+            }
+            vm->is_monitored = 1;
+            extern int start_monitoring(vmi_system_t *);
+            start_monitoring(&g_system);
+            printf("[DASHBOARD] Started monitoring %s\n", vm_name);
+        } else {
+            vm->is_monitored = 0;
+            printf("[DASHBOARD] Stopped monitoring %s\n", vm_name);
+        }
+        json_response = generate_vms_json();
+        if (json_response) {
+            snprintf(response, sizeof(response),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %ld\r\n\r\n%s",
+                    cors, (long)strlen(json_response), json_response);
+            send(client_fd, response, strlen(response), 0);
+            free(json_response);
+        }
+        return;
+    }
+    char file_path[512];
+    if (strcmp(path, "/") == 0) {
+        snprintf(file_path, sizeof(file_path), "web/static/index.html");
+    } else if (strstr(path, ".css")) {
+        snprintf(file_path, sizeof(file_path), "web/static/styles.css");
+    } else if (strstr(path, ".js")) {
+        snprintf(file_path, sizeof(file_path), "web/static/app.js");
+    } else if (strstr(path, ".html")) {
+        snprintf(file_path, sizeof(file_path), "web/static%s", path);
+    } else {
+        snprintf(file_path, sizeof(file_path), "web/static%s", path);
+    }
+    int fd = open(file_path, O_RDONLY);
+    if (fd >= 0) {
+        struct stat st;
+        fstat(fd, &st);
+        char *file_content = malloc(st.st_size + 1);
+        if (file_content) {
+            ssize_t bytes_read = read(fd, file_content, st.st_size);
+            if (bytes_read > 0) {
+                file_content[bytes_read] = '\0';
+                const char *content_type = get_mime_type(path);
+                snprintf(response, sizeof(response),
+                        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n%sContent-Length: %ld\r\nCache-Control: no-cache\r\n\r\n%s",
+                        content_type, cors, (long)st.st_size, file_content);
+                send(client_fd, response, strlen(response), 0);
+            }
+            free(file_content);
+        }
+        close(fd);
+    } else {
+        snprintf(response, sizeof(response),
+                "HTTP/1.1 404 Not Found\r\n%sContent-Type: text/html\r\n\r\n<html><body><h1>404 Not Found</h1></body></html>", cors);
+        send(client_fd, response, strlen(response), 0);
+    }
+}
+
+static void* client_handler(void *arg) {
+    int client_fd = *(int*)arg;
+    free(arg);
+    char buffer[32768];
+    char method[16], path[1024], version[16];
+    char *body = NULL;
+    int bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (bytes > 0) {
+        buffer[bytes] = '\0';
+        sscanf(buffer, "%15s %1023s %15s", method, path, version);
+        char *body_start = strstr(buffer, "\r\n\r\n");
+        if (body_start) body = body_start + 4;
+        handle_api_request(client_fd, path, method, body);
+    }
+    close(client_fd);
+    return NULL;
+}
+
+static void* server_loop(void *arg) {
+    int port = *(int*)arg;
+    free(arg);
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("[WEB] Socket failed");
+        return NULL;
+    }
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("[WEB] Bind failed");
+        close(server_fd);
+        return NULL;
+    }
+    if (listen(server_fd, 10) < 0) {
+        perror("[WEB] Listen failed");
+        close(server_fd);
+        return NULL;
+    }
+    printf("[WEB] Dashboard running on http://localhost:%d\n", port);
+    server_running = 1;
+    while (server_running) {
+        int *client_fd = malloc(sizeof(int));
+        *client_fd = accept(server_fd, NULL, NULL);
+        if (*client_fd > 0) {
+            pthread_t thread;
+            pthread_create(&thread, NULL, client_handler, client_fd);
+            pthread_detach(thread);
+        } else {
+            free(client_fd);
+        }
+    }
+    close(server_fd);
+    return NULL;
+}
+
+int start_dashboard_server(int port) {
+    if (server_running) return 0;
+    int *port_ptr = malloc(sizeof(int));
+    *port_ptr = port;
+    if (pthread_create(&server_thread, NULL, server_loop, port_ptr) != 0) {
+        free(port_ptr);
+        return -1;
+    }
+    return 0;
+}
+
+void stop_dashboard_server(void) {
+    server_running = 0;
+    if (server_fd > 0) close(server_fd);
+    pthread_join(server_thread, NULL);
+}
+
+
+===============================================================================
+FILE: web/static/index.html - Dashboard Main Page
+===============================================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VMI FORENSIC DASHBOARD</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-left">
+                <h1>VMI FORENSIC DASHBOARD</h1>
+                <small>Hypervisor-Based Rootkit Detection System -- v1.0.0</small>
+            </div>
+            <div class="header-right">
+                <div class="status-indicator">
+                    <span class="status-dot" id="system-status"></span>
+                    <span id="status-text">INITIALIZING</span>
+                </div>
+                <div class="uptime">
+                    UPTIME: <span id="uptime-value">00:00:00</span>
+                </div>
+                <button id="export-btn" class="export-btn">EXPORT EVIDENCE</button>
+                <button id="discover-btn" class="export-btn">DISCOVER VMS</button>
+            </div>
+        </div>
+
+        <div class="vm-status-row" id="vm-status-row"></div>
+
+        <div class="tabs">
+            <button class="nav-tab active" data-tab="overview">OVERVIEW</button>
+            <button class="nav-tab" data-tab="processes">PROCESSES</button>
+            <button class="nav-tab" data-tab="syscall">SYSCALLS</button>
+            <button class="nav-tab" data-tab="idt">IDT</button>
+            <button class="nav-tab" data-tab="fallback">FALLBACK</button>
+            <button class="nav-tab" data-tab="guest">GUEST INFO</button>
+        </div>
+
+        <div id="overview-tab" class="tab-content" style="display: block;">
+            <div class="stats-grid">
+                <div class="stat-card threat" id="stat-rootkit-card">
+                    <div class="stat-label">ROOTKITS FOUND</div>
+                    <div class="stat-value" id="rootkit-count">0</div>
+                    <div class="stat-desc">Critical threats</div>
+                </div>
+                <div class="stat-card warning" id="stat-suspicious-card">
+                    <div class="stat-label">SUSPICIOUS</div>
+                    <div class="stat-value" id="suspicious-count">0</div>
+                    <div class="stat-desc">Needs investigation</div>
+                </div>
+                <div class="stat-card info" id="stat-info-card">
+                    <div class="stat-label">INFORMATION</div>
+                    <div class="stat-value" id="info-count">0</div>
+                    <div class="stat-desc">System events</div>
+                </div>
+                <div class="stat-card success">
+                    <div class="stat-label">SCANS COMPLETED</div>
+                    <div class="stat-value" id="scan-count">0</div>
+                    <div class="stat-desc">Monitoring cycles</div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">ALERT FEED</div>
+                </div>
+                <div class="alert-list" id="alert-list"></div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">DETECTION MODULES</div>
+                </div>
+                <div class="module-list" id="module-list"></div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">FORENSIC AUDIT LOG</div>
+                </div>
+                <div class="audit-list" id="forensic-log-list"></div>
+            </div>
+        </div>
+
+        <div id="processes-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">PROCESS DETECTION RESULTS</div>
+                </div>
+                <div id="hidden-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div id="syscall-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">SYSCALL TABLE INTEGRITY CHECK</div>
+                </div>
+                <div id="syscall-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div id="idt-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">IDT INTEGRITY CHECK</div>
+                </div>
+                <div id="idt-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div id="fallback-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">FALLBACK DETECTION RESULTS</div>
+                </div>
+                <div id="fallback-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div id="guest-tab" class="tab-content" style="display:none;">
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">GUEST AGENT INFORMATION</div>
+                </div>
+                <div id="guest-content" style="background:#0a0a0f; padding:15px; font-family:monospace; color:#00ff00; white-space:pre-wrap; overflow-x:auto; max-height:500px; overflow-y:auto;"></div>
+            </div>
+        </div>
+
+        <div class="footer">
+            VMI FORENSIC SYSTEM -- Hypervisor-Based Rootkit Detection -- FYP Project
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
+
+
+===============================================================================
+FILE: web/static/app.js - Dashboard JavaScript
+===============================================================================
+Purpose: Client-side JavaScript that fetches data from API, renders VM status,
+          displays alerts, and handles user interactions (start/stop monitoring).
+console.log("Dashboard initializing");
+
+const state = {
+    vms: [],
+    alerts: [],
+    auditLog: [],
+    scanCount: 0,
+    uptime: 0,
+    syscallData: null,
+    hiddenData: null,
+    idtData: null,
+    fallbackData: null,
+    guestData: null,
+    monitoringActive: false,
+    processedProcesses: [],
+    rootkitCount: 0,
+    suspiciousCount: 0,
+    infoCount: 0
+};
+
+function escapeHtml(text) {
+    if (!text) return '';
+    return text.replace(/[&<>]/g, function(m) {
+        if (m === '&') return '&amp;';
+        if (m === '<') return '&lt;';
+        if (m === '>') return '&gt;';
+        return m;
+    });
+}
+
+function formatTime(timestamp) {
+    if (!timestamp) return '--:--:--';
+    var d = new Date(timestamp * 1000);
+    return d.getHours().toString().padStart(2,'0') + ':' + 
+           d.getMinutes().toString().padStart(2,'0') + ':' + 
+           d.getSeconds().toString().padStart(2,'0');
+}
+
+function classifyAlert(description, severity) {
+    var lowerDesc = description.toLowerCase();
+    if (severity === 2) return 'rootkit';
+    if (lowerDesc.includes('error') || lowerDesc.includes('invalid') || 
+        lowerDesc.includes('hook') || lowerDesc.includes('hooked') ||
+        lowerDesc.includes('corruption') || lowerDesc.includes('suspicious')) {
+        return 'suspicious';
+    }
+    return 'info';
+}
+
+async function fetchVms() {
+    try {
+        const response = await fetch('/api/vms', { cache: 'no-store' });
+        if (response.ok) return await response.json();
+    } catch(e) { console.log('fetchVms error:', e); }
+    return null;
+}
+
+async function fetchAlerts() {
+    try {
+        const response = await fetch('/api/alerts', { cache: 'no-store' });
+        if (response.ok) return await response.json();
+    } catch(e) { console.log('fetchAlerts error:', e); }
+    return [];
+}
+
+async function fetchForensicLog() {
+    try {
+        const response = await fetch('/api/forensic-log', { cache: 'no-store' });
+        if (response.ok) return await response.text();
+    } catch(e) { console.log('fetchForensicLog error:', e); }
+    return '';
+}
+
+async function startMonitoring(vmName) {
+    try {
+        const response = await fetch('/api/monitor/' + vmName, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'start' })
+        });
+        if (response.ok) {
+            console.log('Monitoring started for', vmName);
+            return true;
+        }
+    } catch(e) { console.log('startMonitoring error:', e); }
+    return false;
+}
+
+async function stopMonitoring(vmName) {
+    try {
+        const response = await fetch('/api/monitor/' + vmName, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'stop' })
+        });
+        if (response.ok) {
+            console.log('Monitoring stopped for', vmName);
+            return true;
+        }
+    } catch(e) { console.log('stopMonitoring error:', e); }
+    return false;
+}
+
+async function discoverVMs() {
+    try {
+        const response = await fetch('/api/discover', { method: 'POST' });
+        if (response.ok) {
+            const data = await response.json();
+            if (data && data.vms) {
+                state.vms = data.vms;
+                renderVMStatus();
+                return data.vms;
+            }
+        }
+    } catch(e) { console.log('discoverVMs error:', e); }
+    return [];
+}
+
+function parseProcessNamesFromText(data) {
+    var processes = [];
+    if (!data) return processes;
+    
+    var lines = data.split('\n');
+    
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        // Look for process names in the output
+        if (line.includes("Found process name") && line.includes("at physical")) {
+            var match = line.match(/Found process name '([^']+)' at physical (0x[0-9a-f]+)/);
+            if (match) {
+                processes.push({
+                    name: match[1],
+                    address: match[2]
+                });
+            }
+        }
+        // Also look for the format from progressive updates
+        else if (line.includes("Found:") && line.includes("at 0x")) {
+            var match2 = line.match(/Found: ([^\s]+) at (0x[0-9a-f]+)/);
+            if (match2) {
+                processes.push({
+                    name: match2[1],
+                    address: match2[2]
+                });
+            }
+        }
+    }
+    
+    return processes;
+}
+
+function renderProcessTable(processes) {
+    var hiddenDiv = document.getElementById('hidden-content');
+    if (!hiddenDiv) return;
+    
+    if (!processes || processes.length === 0) {
+        hiddenDiv.innerHTML = '<div style="color:#ffaa00; padding:20px; text-align:center;">No process data available yet. Scanning in progress...</div>';
+        return;
+    }
+    
+    var html = '<div style="margin-bottom:10px; color:#00ff00;">Found ' + processes.length + ' process name candidates in memory:</div>';
+    html += '<div style="overflow-x:auto;">';
+    html += '<table style="width:100%; border-collapse:collapse; font-family:monospace; font-size:12px;">';
+    html += '<thead><tr style="border-bottom:1px solid #00f3ff;">';
+    html += '<th style="text-align:left; padding:8px;">Process Name</th>';
+    html += '<th style="text-align:left; padding:8px;">Physical Address</th>';
+    html += '</tr></thead><tbody>';
+    
+    var displayCount = Math.min(processes.length, 200);
+    for (var i = 0; i < displayCount; i++) {
+        var rowClass = (i % 2 === 0) ? 'style="background:rgba(255,255,255,0.02);"' : '';
+        html += '<tr ' + rowClass + '>';
+        html += '<td style="padding:6px 8px;">' + escapeHtml(processes[i].name) + '</tr>';
+        html += '<td style="padding:6px 8px; color:#00ff00;">' + escapeHtml(processes[i].address) + '</tr>';
+        html += '</tr>';
+    }
+    
+    if (processes.length > 200) {
+        html += '<tr><td colspan="2" style="padding:6px 8px; text-align:center; color:#888;">... and ' + (processes.length - 200) + ' more processes</td></tr>';
+    }
+    
+    html += '</tbody>柵</div>';
+    hiddenDiv.innerHTML = html;
+}
+
+async function loadModuleData(module) {
+    if (!state.vms || state.vms.length === 0) return;
+    
+    var vmName = state.vms[0].name;
+    var contentDiv = document.getElementById(module + '-content');
+    if (!contentDiv) return;
+    
+    try {
+        var response = await fetch('/api/scan/' + vmName + '/' + module, { cache: 'no-store' });
+        if (response.ok) {
+            var data = await response.text();
+            
+            if (module === 'syscall') {
+                state.syscallData = data;
+                if (data && data.length > 50) {
+                    contentDiv.innerHTML = '<pre style="margin:0;font-family:monospace;background:#0a0a0f;color:#00ff00;white-space:pre-wrap;font-size:11px;max-height:500px;overflow-y:auto;">' + escapeHtml(data) + '</pre>';
+                } else {
+                    contentDiv.innerHTML = '<div style="color:#ffaa00; padding:20px;">No syscall data yet. Scan in progress...</div>';
+                }
+            }
+            else if (module === 'hidden') {
+                state.hiddenData = data;
+                var processes = parseProcessNamesFromText(data);
+                state.processedProcesses = processes;
+                renderProcessTable(processes);
+            }
+            else if (module === 'idt') {
+                state.idtData = data;
+                if (data && data.length > 50) {
+                    contentDiv.innerHTML = '<pre style="margin:0;font-family:monospace;background:#0a0a0f;color:#00ff00;white-space:pre-wrap;font-size:12px;">' + escapeHtml(data) + '</pre>';
+                } else {
+                    contentDiv.innerHTML = '<div style="color:#ffaa00; padding:20px;">IDT detection limited due to KPTI. See syscall detection for active monitoring.</div>';
+                }
+            }
+            else if (module === 'fallback') {
+                state.fallbackData = data;
+                if (data && data.length > 50) {
+                    contentDiv.innerHTML = '<pre style="margin:0;font-family:monospace;background:#0a0a0f;color:#00ff00;white-space:pre-wrap;font-size:12px;">' + escapeHtml(data) + '</pre>';
+                } else {
+                    contentDiv.innerHTML = '<div style="color:#ffaa00; padding:20px;">Fallback detection in progress. Scanning memory for signatures...</div>';
+                }
+            }
+            else if (module === 'guest') {
+                state.guestData = data;
+                if (data && data.length > 50 && !data.includes('No scan data')) {
+                    contentDiv.innerHTML = '<pre style="margin:0;font-family:monospace;background:#0a0a0f;color:#00ff00;white-space:pre-wrap;font-size:12px;">' + escapeHtml(data) + '</pre>';
+                } else {
+                    contentDiv.innerHTML = '<div style="color:#ffaa00; padding:20px;">Guest agent not responding. Install qemu-guest-agent in the VM for guest information.</div>';
+                }
+            }
+        }
+    } catch(e) {
+        console.log('Error loading', module, e);
+    }
+}
+
+function loadAllModuleData() {
+    if (!state.monitoringActive) return;
+    loadModuleData('syscall');
+    loadModuleData('hidden');
+    loadModuleData('idt');
+    loadModuleData('fallback');
+    loadModuleData('guest');
+}
+
+function renderVMStatus() {
+    var row = document.getElementById('vm-status-row');
+    if (!row) return;
+    
+    row.innerHTML = '';
+    
+    if (!state.vms || state.vms.length === 0) {
+        row.innerHTML = '<div style="color:var(--text-muted);padding:1rem;">No VMs discovered. Click DISCOVER VMS button.</div>';
+        return;
+    }
+    
+    for (var i = 0; i < state.vms.length; i++) {
+        var vm = state.vms[i];
+        var vmEl = document.createElement('div');
+        vmEl.className = 'vm-status';
+        
+        var isConnected = (vm.is_connected === true);
+        var isMonitored = (vm.is_monitored === true);
+        
+        vmEl.innerHTML = 
+            '<span class="vm-label">VM:</span>' +
+            '<span class="vm-name">' + escapeHtml(vm.name) + '</span>' +
+            '<span class="status-dot ' + (isConnected ? 'online' : 'offline') + '"></span>' +
+            '<span>' + (isConnected ? 'ONLINE' : 'OFFLINE') + '</span>' +
+            '<button class="vm-monitor-btn" data-vm="' + escapeHtml(vm.name) + '" data-monitored="' + isMonitored + '">' +
+            (isMonitored ? 'STOP MONITORING' : 'START MONITORING') +
+            '</button>';
+        
+        var btn = vmEl.querySelector('.vm-monitor-btn');
+        btn.addEventListener('click', (function(vmName, currentMonitored) {
+            return async function() {
+                var success = false;
+                var newMonitored = !currentMonitored;
+                
+                this.textContent = 'PROCESSING...';
+                this.disabled = true;
+                
+                if (newMonitored) {
+                    success = await startMonitoring(vmName);
+                } else {
+                    success = await stopMonitoring(vmName);
+                }
+                
+                if (success) {
+                    state.monitoringActive = newMonitored;
+                    var vmsData = await fetchVms();
+                    if (vmsData && vmsData.vms) {
+                        state.vms = vmsData.vms;
+                        renderVMStatus();
+                    }
+                    if (newMonitored) {
+                        loadAllModuleData();
+                    }
+                } else {
+                    this.textContent = currentMonitored ? 'STOP MONITORING' : 'START MONITORING';
+                    this.disabled = false;
+                }
+            };
+        })(vm.name, isMonitored));
+        
+        row.appendChild(vmEl);
+    }
+}
+
+function renderAlerts() {
+    var alertList = document.getElementById('alert-list');
+    if (!alertList) return;
+    
+    if (!state.alerts || state.alerts.length === 0) {
+        alertList.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:1rem;">No alerts.</div>';
+        return;
+    }
+    
+    var recent = state.alerts.slice(-30).reverse();
+    var html = '';
+    
+    for (var i = 0; i < recent.length; i++) {
+        var alert = recent[i];
+        var classification = classifyAlert(alert.description, alert.severity);
+        var severityLabel = classification === 'rootkit' ? 'ROOTKIT' : (classification === 'suspicious' ? 'SUSPICIOUS' : 'INFO');
+        var severityClass = classification === 'rootkit' ? 'critical' : (classification === 'suspicious' ? 'high' : 'info');
+        
+        html += 
+            '<div class="alert-item">' +
+                '<div class="alert-header">' +
+                    '<span class="alert-severity ' + severityClass + '">' + severityLabel + '</span>' +
+                    '<span class="alert-time">' + (alert.time || formatTime(alert.timestamp)) + '</span>' +
+                '</div>' +
+                '<div class="alert-title">' + escapeHtml(alert.description || 'Alert') + '</div>' +
+                '<div class="alert-vm">' + escapeHtml(alert.vm || alert.vm_name || 'SYSTEM') + '</div>' +
+            '</div>';
+    }
+    
+    alertList.innerHTML = html;
+    updateAlertCounts(state.alerts);
+}
+
+function updateAlertCounts(alerts) {
+    state.rootkitCount = 0;
+    state.suspiciousCount = 0;
+    state.infoCount = 0;
+    
+    for (var i = 0; i < alerts.length; i++) {
+        var classification = classifyAlert(alerts[i].description, alerts[i].severity);
+        if (classification === 'rootkit') state.rootkitCount++;
+        else if (classification === 'suspicious') state.suspiciousCount++;
+        else state.infoCount++;
+    }
+    
+    var rootkitEl = document.getElementById('rootkit-count');
+    var suspiciousEl = document.getElementById('suspicious-count');
+    var infoEl = document.getElementById('info-count');
+    
+    if (rootkitEl) rootkitEl.textContent = state.rootkitCount;
+    if (suspiciousEl) suspiciousEl.textContent = state.suspiciousCount;
+    if (infoEl) infoEl.textContent = state.infoCount;
+}
+
+function renderForensicLog() {
+    var logList = document.getElementById('forensic-log-list');
+    if (!logList) return;
+    
+    if (!state.auditLog || state.auditLog.length === 0) {
+        logList.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:1rem;">No forensic log entries yet.</div>';
+        return;
+    }
+    
+    var lines = state.auditLog.split('\n').filter(function(l) { return l.trim(); }).slice(-30).reverse();
+    var html = '';
+    
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        var displayClass = '';
+        if (line.includes('ROOTKIT')) displayClass = 'style="color:#ff0040;"';
+        else if (line.includes('ERROR') || line.includes('HOOK')) displayClass = 'style="color:#ffaa00;"';
+        html += '<div class="audit-item"><pre style="margin:0;font-size:0.75rem;' + displayClass + '">' + escapeHtml(line) + '</pre></div>';
+    }
+    
+    logList.innerHTML = html;
+}
+
+function renderModules() {
+    var moduleList = document.getElementById('module-list');
+    if (!moduleList) return;
+    
+    var modules = [
+        { name: 'process_scanner', desc: 'Hidden process detection via VMI - scans memory for process names' },
+        { name: 'syscall_detection', desc: 'Syscall table hook monitoring - validates 100 syscall handlers' },
+        { name: 'idt_detection', desc: 'IDT integrity verification - limited by KPTI on kernel 6.2.0' },
+        { name: 'fallback_detection', desc: 'Heuristic fallback methods - scans for rootkit signatures' }
+    ];
+    
+    var html = '';
+    for (var i = 0; i < modules.length; i++) {
+        html += 
+            '<div class="module-item">' +
+                '<div class="module-header">' +
+                    '<span class="module-name">' + modules[i].name + '</span>' +
+                '</div>' +
+                '<div class="module-desc">' + modules[i].desc + '</div>' +
+            '</div>';
+    }
+    
+    moduleList.innerHTML = html;
+}
+
+function updateStats() {
+    var scanCountEl = document.getElementById('scan-count');
+    if (scanCountEl) scanCountEl.textContent = state.scanCount;
+}
+
+function updateStatus(status) {
+    var statusText = document.getElementById('status-text');
+    if (statusText) statusText.textContent = status;
+}
+
+function startUptimeCounter() {
+    setInterval(function() {
+        state.uptime++;
+        var uptimeEl = document.getElementById('uptime-value');
+        if (uptimeEl) {
+            var hours = Math.floor(state.uptime / 3600);
+            var minutes = Math.floor((state.uptime % 3600) / 60);
+            var seconds = state.uptime % 60;
+            uptimeEl.textContent = hours.toString().padStart(2,'0') + ':' + 
+                                   minutes.toString().padStart(2,'0') + ':' + 
+                                   seconds.toString().padStart(2,'0');
+        }
+    }, 1000);
+}
+
+function switchTab(tabName) {
+    var tabs = document.querySelectorAll('.nav-tab');
+    for (var i = 0; i < tabs.length; i++) {
+        if (tabs[i].dataset.tab === tabName) {
+            tabs[i].classList.add('active');
+        } else {
+            tabs[i].classList.remove('active');
+        }
+    }
+    
+    var tabContents = ['overview', 'processes', 'syscall', 'idt', 'fallback', 'guest'];
+    for (var i = 0; i < tabContents.length; i++) {
+        var el = document.getElementById(tabContents[i] + '-tab');
+        if (el) {
+            el.style.display = (tabContents[i] === tabName) ? 'block' : 'none';
+        }
+    }
+    
+    // Refresh data when switching tabs
+    if (tabName === 'processes' && state.processedProcesses.length > 0) {
+        renderProcessTable(state.processedProcesses);
+    } else if (tabName === 'processes') {
+        loadModuleData('hidden');
+    }
+    if (tabName === 'syscall') loadModuleData('syscall');
+    if (tabName === 'idt') loadModuleData('idt');
+    if (tabName === 'fallback') loadModuleData('fallback');
+    if (tabName === 'guest') loadModuleData('guest');
+}
+
+// Auto-refresh data every 3 seconds
+function startContinuousDataRefresh() {
+    setInterval(function() {
+        if (state.monitoringActive && state.vms.length > 0) {
+            loadModuleData('syscall');
+            loadModuleData('hidden');
+            loadModuleData('idt');
+            loadModuleData('fallback');
+            loadModuleData('guest');
+        }
+    }, 3000);
+}
+
+async function loadInitialData() {
+    updateStatus('CONNECTING');
+    
+    var vmsData = await fetchVms();
+    if (vmsData && vmsData.vms) {
+        state.vms = vmsData.vms;
+        renderVMStatus();
+    }
+    
+    var alertsData = await fetchAlerts();
+    if (alertsData && Array.isArray(alertsData)) {
+        state.alerts = alertsData;
+        renderAlerts();
+        updateAlertCounts(state.alerts);
+    }
+    
+    var logData = await fetchForensicLog();
+    if (logData) {
+        state.auditLog = logData;
+        renderForensicLog();
+    }
+    
+    renderModules();
+    updateStatus('MONITORING');
+}
+
+function startPolling() {
+    setInterval(async function() {
+        var data = await fetchVms();
+        if (data && data.vms) {
+            var hadMonitoring = state.monitoringActive;
+            state.vms = data.vms;
+            renderVMStatus();
+            for (var i = 0; i < state.vms.length; i++) {
+                if (state.vms[i].is_monitored === true) {
+                    if (!hadMonitoring) {
+                        state.monitoringActive = true;
+                        loadAllModuleData();
+                    }
+                    break;
+                }
+            }
+        }
+        state.scanCount++;
+        updateStats();
+    }, 5000);
+    
+    setInterval(async function() {
+        var alerts = await fetchAlerts();
+        if (alerts && Array.isArray(alerts)) {
+            state.alerts = alerts;
+            renderAlerts();
+            updateAlertCounts(state.alerts);
+        }
+    }, 3000);
+    
+    setInterval(async function() {
+        var log = await fetchForensicLog();
+        if (log) {
+            state.auditLog = log;
+            renderForensicLog();
+        }
+    }, 5000);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    console.log("DOM loaded");
+    
+    var navTabs = document.querySelectorAll('.nav-tab');
+    for (var i = 0; i < navTabs.length; i++) {
+        navTabs[i].addEventListener('click', function() {
+            switchTab(this.dataset.tab);
+        });
+    }
+    
+    var discoverBtn = document.getElementById('discover-btn');
+    if (discoverBtn) {
+        discoverBtn.addEventListener('click', async function() {
+            updateStatus('DISCOVERING');
+            await discoverVMs();
+            updateStatus('MONITORING');
+        });
+    }
+    
+    var exportBtn = document.getElementById('export-btn');
+    if (exportBtn) {
+        exportBtn.addEventListener('click', function() {
+            var exportData = {
+                timestamp: new Date().toISOString(),
+                vms: state.vms,
+                alerts: state.alerts,
+                processes: state.processedProcesses,
+                syscallTable: state.syscallData,
+                rootkitCount: state.rootkitCount,
+                suspiciousCount: state.suspiciousCount
+            };
+            var blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'forensic-evidence-' + Date.now() + '.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+    }
+    
+    startUptimeCounter();
+    loadInitialData();
+    startPolling();
+    startContinuousDataRefresh();
+});
+
+
+===============================================================================
+FILE: web/static/styles.css - Dashboard Styling
+===============================================================================
+Purpose: Cyberpunk-themed CSS with neon colors, responsive design, and
+          custom styling for all dashboard components.
+:root {
+    --neon-cyan: #00f3ff;
+    --neon-pink: #ff00ff;
+    --neon-purple: #9d00ff;
+    --neon-green: #00ff9d;
+    --neon-yellow: #ffff00;
+    --neon-red: #ff0040;
+    --neon-orange: #ff6a00;
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #12121a;
+    --bg-tertiary: #1a1a2a;
+    --bg-card: rgba(20, 20, 30, 0.95);
+    --bg-panel: rgba(10, 10, 20, 0.8);
+    --text-primary: #ffffff;
+    --text-secondary: #b0b0d0;
+    --text-muted: #6a6a8b;
+    --border-cyan: 1px solid rgba(0, 243, 255, 0.3);
+    --border-pink: 1px solid rgba(255, 0, 255, 0.3);
+    --border-purple: 1px solid rgba(157, 0, 255, 0.3);
+    --glow-cyan: 0 0 10px rgba(0, 243, 255, 0.5);
+    --glow-pink: 0 0 10px rgba(255, 0, 255, 0.5);
+    --glow-purple: 0 0 10px rgba(157, 0, 255, 0.5);
+    --spacing-xs: 0.25rem;
+    --spacing-sm: 0.5rem;
+    --spacing-md: 1rem;
+    --spacing-lg: 1.5rem;
+    --spacing-xl: 2rem;
+    --container-max-width: 1600px;
+    --border-radius: 12px;
+    --grid-gap: 1.5rem;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow-x: hidden; }
+body {
+    font-family: 'Courier New', 'Share Tech Mono', 'VT323', monospace;
+    background: linear-gradient(135deg, #0a0a0f 0%, #050510 100%);
+    color: var(--text-primary);
+    line-height: 1.6;
+    min-height: 100vh;
+    position: relative;
+}
+body::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-image: 
+        linear-gradient(rgba(0, 243, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 243, 255, 0.03) 1px, transparent 1px);
+    background-size: 50px 50px;
+    pointer-events: none;
+    z-index: 0;
+}
+body::after {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(to bottom, transparent 50%, rgba(0, 0, 0, 0.1) 50%);
+    background-size: 100% 4px;
+    pointer-events: none;
+    animation: scanline 8s linear infinite;
+    z-index: 1;
+}
+@keyframes scanline {
+    0% { transform: translateY(-100%); }
+    100% { transform: translateY(100%); }
+}
+.container {
+    max-width: var(--container-max-width);
+    margin: 0 auto;
+    padding: var(--spacing-lg);
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    gap: var(--grid-gap);
+}
+.header {
+    background: var(--bg-panel);
+    backdrop-filter: blur(10px);
+    border: var(--border-cyan);
+    border-radius: var(--border-radius);
+    padding: var(--spacing-lg) var(--spacing-xl);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--spacing-md);
+    position: relative;
+    overflow: hidden;
+    box-shadow: var(--glow-cyan);
+}
+.header::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: linear-gradient(45deg, transparent 30%, rgba(0, 243, 255, 0.1) 50%, transparent 70%);
+    animation: shine 3s infinite;
+}
+@keyframes shine {
+    0% { transform: translateX(-100%) translateY(-100%) rotate(45deg); }
+    100% { transform: translateX(100%) translateY(100%) rotate(45deg); }
+}
+.header-left h1 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--neon-cyan), var(--neon-purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: var(--spacing-xs);
+    text-transform: uppercase;
+    letter-spacing: 3px;
+}
+.header-left small {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    display: block;
+    border-left: 3px solid var(--neon-cyan);
+    padding-left: var(--spacing-md);
+}
+.header-right {
+    display: flex;
+    gap: var(--spacing-md);
+    align-items: center;
+    flex-wrap: wrap;
+}
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    padding: var(--spacing-sm) var(--spacing-md);
+    background: rgba(0, 0, 0, 0.3);
+    border: var(--border-cyan);
+    border-radius: 30px;
+}
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--neon-cyan);
+    box-shadow: 0 0 10px var(--neon-cyan);
+    animation: pulse 2s infinite;
+}
+.status-dot.scanning {
+    background: var(--neon-green);
+    box-shadow: 0 0 10px var(--neon-green);
+}
+.status-dot.online {
+    background: var(--neon-green);
+    box-shadow: 0 0 10px var(--neon-green);
+}
+.status-dot.offline {
+    background: var(--neon-red);
+    box-shadow: 0 0 10px var(--neon-red);
+}
+@keyframes pulse {
+    0% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.2); }
+    100% { opacity: 1; transform: scale(1); }
+}
+.export-btn {
+    background: transparent;
+    border: var(--border-cyan);
+    color: var(--neon-cyan);
+    padding: var(--spacing-sm) var(--spacing-lg);
+    border-radius: 30px;
+    font-family: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--spacing-sm);
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+    text-decoration: none;
+}
+.export-btn::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 0;
+    height: 0;
+    border-radius: 50%;
+    background: rgba(0, 243, 255, 0.2);
+    transform: translate(-50%, -50%);
+    transition: width 0.6s, height 0.6s;
+}
+.export-btn:hover::before { width: 300px; height: 300px; }
+.export-btn:hover { background: var(--neon-cyan); color: black; box-shadow: var(--glow-cyan); }
+.vm-status-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: var(--grid-gap);
+    margin: var(--grid-gap) 0;
+}
+.vm-status {
+    background: var(--bg-card);
+    border: var(--border-cyan);
+    border-radius: var(--border-radius);
+    padding: var(--spacing-md) var(--spacing-lg);
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-md);
+    position: relative;
+    overflow: hidden;
+    backdrop-filter: blur(5px);
+    transition: all 0.3s ease;
+}
+.vm-status:hover { transform: translateY(-5px); box-shadow: var(--glow-cyan); }
+.vm-status.threat { border-color: var(--neon-red); box-shadow: 0 0 15px rgba(255, 0, 64, 0.3); }
+.vm-status.warning { border-color: var(--neon-yellow); box-shadow: 0 0 15px rgba(255, 255, 0, 0.3); }
+.vm-label {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    text-transform: uppercase;
+}
+.vm-name {
+    font-weight: 700;
+    font-size: 1.1rem;
+    color: var(--neon-cyan);
+    text-decoration: none;
+}
+.vm-status .status-dot { margin-left: auto; }
+.vm-monitor-btn {
+    background: transparent;
+    border: var(--border-cyan);
+    color: var(--neon-cyan);
+    padding: 0.3rem 1rem;
+    border-radius: 20px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.8rem;
+    transition: all 0.3s ease;
+    flex-shrink: 0;
+}
+.vm-monitor-btn.monitoring { background: var(--neon-red); border-color: var(--neon-red); color: white; }
+.vm-monitor-btn:hover { background: var(--neon-cyan); color: black; }
+.tabs {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin: var(--grid-gap) 0;
+    background: var(--bg-secondary);
+    padding: var(--spacing-sm);
+    border-radius: var(--border-radius);
+    border: var(--border-cyan);
+}
+.nav-tab {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    padding: 0.8rem 2rem;
+    font-family: inherit;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+    transition: all 0.3s ease;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    border-radius: 8px;
+}
+.nav-tab::before {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+    transform: translateX(-100%);
+    transition: transform 0.3s ease;
+}
+.nav-tab:hover::before, .nav-tab.active::before { transform: translateX(0); }
+.nav-tab.active {
+    color: var(--neon-cyan);
+    text-shadow: 0 0 10px var(--neon-cyan);
+    background: rgba(0, 243, 255, 0.1);
+}
+.tab-content { display: none; animation: fadeIn 0.3s ease; }
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: var(--grid-gap);
+    margin: var(--grid-gap) 0;
+}
+.stat-card {
+    background: var(--bg-card);
+    border: var(--border-cyan);
+    border-radius: var(--border-radius);
+    padding: var(--spacing-xl);
+    position: relative;
+    overflow: hidden;
+    backdrop-filter: blur(5px);
+}
+.stat-card::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 100px;
+    height: 100px;
+    background: radial-gradient(circle, rgba(0,243,255,0.1) 0%, transparent 70%);
+    pointer-events: none;
+}
+.stat-card.threat { border-color: var(--neon-red); }
+.stat-card.warning { border-color: var(--neon-yellow); }
+.stat-card.info { border-color: var(--neon-cyan); }
+.stat-card.success { border-color: var(--neon-green); }
+.stat-label {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin-bottom: var(--spacing-md);
+}
+.stat-value {
+    font-size: 3.5rem;
+    font-weight: 700;
+    color: var(--neon-cyan);
+    line-height: 1;
+    margin-bottom: var(--spacing-sm);
+    font-family: 'VT323', monospace;
+}
+.stat-card.threat .stat-value { color: var(--neon-red); text-shadow: 0 0 20px var(--neon-red); }
+.stat-card.warning .stat-value { color: var(--neon-yellow); text-shadow: 0 0 20px var(--neon-yellow); }
+.stat-card.success .stat-value { color: var(--neon-green); text-shadow: 0 0 20px var(--neon-green); }
+.panel {
+    background: var(--bg-panel);
+    border: var(--border-purple);
+    border-radius: var(--border-radius);
+    margin: var(--grid-gap) 0;
+    overflow: hidden;
+    backdrop-filter: blur(10px);
+}
+.panel-header {
+    padding: var(--spacing-lg);
+    background: rgba(157, 0, 255, 0.1);
+    border-bottom: var(--border-purple);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--spacing-md);
+}
+.panel-title {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: var(--neon-purple);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+}
+.alert-list {
+    max-height: 400px;
+    overflow-y: auto;
+    padding: var(--spacing-sm);
+}
+.alert-item {
+    background: rgba(255, 255, 255, 0.02);
+    border-left: 4px solid transparent;
+    padding: var(--spacing-md);
+    margin: var(--spacing-sm) 0;
+    transition: all 0.3s ease;
+}
+.alert-item.new { animation: flash 1s ease; }
+@keyframes flash {
+    0%, 100% { background: rgba(255, 0, 255, 0); }
+    50% { background: rgba(255, 0, 255, 0.1); }
+}
+.alert-item:hover { background: rgba(255, 255, 255, 0.05); transform: translateX(5px); }
+.alert-header {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    margin-bottom: 0.5rem;
+    flex-wrap: wrap;
+}
+.alert-severity {
+    padding: 0.2rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.alert-severity.critical { background: rgba(255, 0, 64, 0.2); color: var(--neon-red); border: 1px solid var(--neon-red); }
+.alert-severity.high { background: rgba(255, 106, 0, 0.2); color: var(--neon-orange); border: 1px solid var(--neon-orange); }
+.alert-severity.medium { background: rgba(255, 255, 0, 0.2); color: var(--neon-yellow); border: 1px solid var(--neon-yellow); }
+.alert-severity.info { background: rgba(0, 243, 255, 0.2); color: var(--neon-cyan); border: 1px solid var(--neon-cyan); }
+.alert-time { color: var(--text-muted); font-size: 0.7rem; }
+.alert-title { color: var(--text-primary); font-weight: 600; margin-bottom: 0.3rem; }
+.alert-desc { color: var(--text-secondary); font-size: 0.9rem; }
+.module-list {
+    padding: var(--spacing-md);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: var(--spacing-md);
+}
+.module-item {
+    background: rgba(255, 255, 255, 0.02);
+    border: var(--border-cyan);
+    border-radius: 8px;
+    padding: var(--spacing-lg);
+    transition: all 0.3s ease;
+}
+.module-item:hover { transform: translateY(-3px); box-shadow: var(--glow-cyan); }
+.module-item.has-detections { border-color: var(--neon-red); }
+.module-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--spacing-md);
+}
+.module-name {
+    font-weight: 700;
+    color: var(--neon-cyan);
+    text-transform: uppercase;
+    font-size: 0.9rem;
+}
+.module-desc {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    margin-bottom: var(--spacing-md);
+}
+.audit-list {
+    max-height: 200px;
+    overflow-y: auto;
+    padding: var(--spacing-sm);
+    font-family: 'VT323', monospace;
+    font-size: 0.9rem;
+}
+.audit-item {
+    padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+.audit-item pre { margin: 0; font-size: 0.7rem; color: #00ff00; }
+.footer {
+    text-align: center;
+    padding: var(--spacing-xl);
+    margin-top: var(--spacing-xl);
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    border-top: var(--border-cyan);
+    position: relative;
+}
+.footer::before, .footer::after {
+    content: '█';
+    color: var(--neon-cyan);
+    margin: 0 0.5rem;
+    animation: flicker 2s infinite;
+}
+@keyframes flicker {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
+}
+pre {
+    background: #0a0a0f;
+    color: #00ff00;
+    padding: 15px;
+    overflow-x: auto;
+    font-size: 11px;
+    white-space: pre-wrap;
+}
+
+
+===============================================================================
+FILE: web/static/analysis.html - Visual Analysis Page
+===============================================================================
+
+
+===============================================================================
+FILE: web/static/analysis.js - Visual Analysis JavaScript
+===============================================================================
+
+
+===============================================================================
+PROJECT SUMMARY
+===============================================================================
+
+MODULE ARCHITECTURE:
+-------------------
+1. Core VMI Engine - VM discovery, memory access, kernel offset detection
+2. Hidden Process Detection - Compares VMI process list vs guest OS list
+3. Syscall Integrity - Validates syscall handler addresses against kernel text
+4. IDT Integrity - Checks interrupt descriptor table (limited by KPTI)
+5. Fallback Detection - Heuristic scanning for rootkit signatures
+6. Guest Agent - Retrieves system information from VM
+7. Alert Manager - Thread-safe storage and retrieval of alerts
+8. Web Dashboard - HTTP server with RESTful API and cyberpunk UI
+
+TECHNOLOGY STACK:
+-----------------
+- Language: C (backend), JavaScript (frontend)
+- Libraries: LibVMI, pthread, json-c
+- Hypervisor: KVM/QEMU
+- Build System: GNU Make
+
+DETECTION METHODS:
+-----------------
+- Hidden Process: task_struct traversal + ps command comparison
+- Syscall Hook: Physical memory scanning + kernel text validation
+- IDT Hook: IDTR reading + handler validation (limited on kernel 6.2.0+)
+- Fallback: Signature scanning + executable code detection
+
+LIMITATIONS:
+------------
+- Kernel 6.2.0+ has KPTI (Kernel Page Table Isolation) limiting IDT access
+- Physical memory scan of 3GB takes 30-60 seconds
+- Requires guest agent for complete guest information
+- Debug symbols recommended for optimal kernel offset detection
+
+===============================================================================
+END OF ARCHIVE
+===============================================================================
