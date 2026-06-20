@@ -64,6 +64,56 @@ graph TD
     Monitor -->|Writes Alert| AlertMgr
     AlertMgr -->|Append Only| Log[Forensic Audit Log]
 ```
+## System Diagrams & User Interface
+
+This section illustrates the architectural design and the final user interface of the Hypervisor-Based Rootkit Detection System.
+
+### Architectural Design
+
+The following diagrams depict the high-level architecture, data flow, and module interactions designed during the software engineering phase.
+
+#### 1. Hybrid Three-Tier System Architecture
+![System Architecture](diagrams/THESIS-System-Architecture.png)
+*Figure 1: Hybrid Three-Tier Client-Server Architecture showing the interaction between the Security Analyst, Web Dashboard, Detection Modules, and the KVM/QEMU Hypervisor.*
+
+#### 2. Use Case Diagram
+![Use Case Diagram](diagrams/THESIS-Use-Case-Diagram.png)
+*Figure 2: Use Case Diagram illustrating the Security Analyst's interaction with monitoring modules, including Hidden Process Detection, Syscall Integrity, and Fallback Scanning.*
+
+#### 3. Level 1 Data Flow Diagram (DFD)
+![Level 1 DFD](diagrams/THESIS-L1-DFD.png)
+*Figure 3: Level 1 Data Flow Diagram showing major processes: VM Discovery, Rootkit Detection, Alert Management, and Web Serving.*
+
+#### 4. Class Diagram
+![Class Diagram](diagrams/THESIS-Class-Diagram.png)
+*Figure 4: UML Class Diagram showing the static structure of the detection system, including the VMI Engine, Detection Modules, Alert Manager, and Web Server.*
+
+---
+
+### Dashboard Screenshots
+
+The system features a custom-built, cyberpunk-themed web dashboard for real-time monitoring and forensic analysis.
+
+#### 1. Main Forensic Dashboard
+![Main Dashboard](images/dashboard.png)
+*Figure 5: Main Forensic Dashboard showing real-time alert feed, VM status, and system metrics.*
+
+#### 2. Syscall Table Integrity View
+![Syscall Table](images/syscalls-table.png)
+*Figure 6: Syscall Table Integrity Check showing detected hooks and process status. Handlers outside kernel text are flagged as INVALID.*
+
+#### 3. Hidden Process Detection
+![Process List](images/processes-table.png)
+*Figure 7: Process List view highlighting hidden processes detected via memory traversal compared against the guest OS list.*
+
+#### 4. Fallback Heuristic Detection
+![Fallback Detection](images/fallback.png)
+*Figure 8: Fallback Detection Results showing signature matches (e.g., Diamorphine) when kernel symbols are unavailable due to KASLR.*
+
+#### 5. Forensic Audit Log
+![Forensic Log](images/forensic-log.png)
+*Figure 9: Forensic Audit Log showing timestamped chain-of-custody events stored in an append-only file on the host.*
+
 ## Tech Stack
 
 - **Language:** C (backend), JavaScript (frontend)
