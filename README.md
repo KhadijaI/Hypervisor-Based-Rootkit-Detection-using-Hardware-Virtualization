@@ -73,7 +73,7 @@ This section illustrates the architectural design and the final user interface o
 The following diagrams depict the high-level architecture, data flow, and module interactions designed during the software engineering phase.
 
 #### 1. Hybrid Three-Tier System Architecture
-![System Architecture](diagrams/THESIS-System-Architecture.png)
+![System Architecture](diagrams/Thesis-System-Architecture.png)
 *Figure 1: Hybrid Three-Tier Client-Server Architecture showing the interaction between the Security Analyst, Web Dashboard, Detection Modules, and the KVM/QEMU Hypervisor.*
 
 #### 2. Use Case Diagram
@@ -96,10 +96,10 @@ The system features a custom-built, cyberpunk-themed web dashboard for real-time
 
 #### 1. Main Forensic Dashboard
 ![Main Dashboard](images/dashboard.png)
-*Figure 5: Main Forensic Dashboard showing real-time alert feed, VM status, and system metrics.*
+*Figure 5: Main Forensic Dashboard showing alert feed, VM status, and system metrics.*
 
 #### 2. Syscall Table Integrity View
-![Syscall Table](images/syscalls-table.png)
+![Syscall Table](images/syscall-table.png)
 *Figure 6: Syscall Table Integrity Check showing detected hooks and process status. Handlers outside kernel text are flagged as INVALID.*
 
 #### 3. Hidden Process Detection
