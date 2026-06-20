@@ -13,7 +13,6 @@ A standalone, out-of-band security solution that detects kernel-level rootkits i
 - [Key Features](#key-features)
 - [System Architecture](#system-architecture)
 - [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
 - [Installation and Setup](#installation-and-setup)
 - [Usage](#usage)
 - [Testing and Results](#testing-and-results)
@@ -64,3 +63,111 @@ graph TD
     Hypervisor -->|Reads RAM| GuestVM[Guest VM Infected]
     Monitor -->|Writes Alert| AlertMgr
     AlertMgr -->|Append Only| Log[Forensic Audit Log]
+```
+## Tech Stack
+
+- **Language:** C (backend), JavaScript (frontend)
+- **Libraries:** LibVMI, pthread, json-c
+- **Hypervisor:** KVM/QEMU
+- **Build System:** GNU Make
+
+## Installation and Setup
+
+### Prerequisites
+
+- Ubuntu 22.04 LTS Host
+- Intel VT-x or AMD-V enabled in BIOS
+- Root privileges (`sudo`)
+
+### 1. Install Dependencies
+
+```bash
+sudo apt update
+sudo apt install build-essential libvmi-dev libjson-c-dev libvirt-dev qemu-kvm libvirt-daemon-system
+```
+### 2. Clone the Repository
+
+```bash
+git clone https://github.com/KhadijaI/Hypervisor-Based-Rootkit-Detection-using-Hardware-Virtualization.git
+cd Hypervisor-Based-Rootkit-Detection-using-Hardware-Virtualization
+```
+### 3. Build the Project
+
+```bash
+make clean
+make all
+```
+### 4. Configure Guest VM
+
+Ensure your Guest VM has qemu-guest-agent installed for accurate process comparison (optional but recommended):
+
+```bash
+# Inside Guest VM
+sudo apt install qemu-guest-agent
+sudo systemctl enable qemu-guest-agent
+sudo systemctl start qemu-guest-agent
+```
+
+## Usage
+
+### 1. Start the Detector:
+
+```bash
+sudo ./vmi
+```
+
+### 2. Access the Dashboard:
+
+Open your browser and navigate to:
+http://localhost:5000
+
+### 3. Monitor:
+
+Click Discover VMs to detect running guests.
+Click Start Monitoring on a specific VM.
+View alerts in the Overview tab.
+Check the detailed scans in the Processes, Syscalls, IDT, or Fallback tabs.
+
+## Testing and Results
+
+The system was validated against a clean Ubuntu 22.04 Guest VM and tested for stability over 50+ minutes.
+
+| Metric | Result |
+| :--- | :--- |
+| CPU Overhead | < 2% (Idle between scans) |
+| Memory Footprint | ~45 MB (Stable) |
+| Detection Accuracy | Successfully identified hidden processes & syscall hooks in controlled tests |
+| Stability | Zero crashes during extended monitoring |
+
+## Documentation
+
+For a deep dive into the algorithms, architecture, and theoretical background, please refer to the official thesis report included in the repository:
+
+- [Thesis Report.pdf](Thesis_Report.pdf)
+- [Software Requirements Specification (SRS)](docs/SRS.pdf)
+- [Software Design Document (SDD)](docs/SDD.pdf)
+
+## Contributing
+
+Contributions are welcome! If you have suggestions for improving detection algorithms or UI enhancements:
+
+1. Fork the Project
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
+
+## License
+
+Distributed under the MIT License. See `LICENSE` for more information.
+
+## Academic Context
+
+This project was developed as a Final Year Project (FYP) for the **Bachelor of Science in Computer Science** at **COMSATS University Islamabad, Vehari Campus**.
+
+- **Student:** Khadija Iqbal (FA20-BCS-035)
+- **Supervisor:** Dr. Rab Nawaz
+
+
+
+
